@@ -292,6 +292,28 @@ def api_clip_activations(idx):
     def _round_1d(arr):
         return [round(float(v), 4) for v in arr]
 
+    # Per-frame predictive entropy, in bits-per-class so every head sits on the
+    # same [0, 1] scale regardless of its number of classes: binary entropy
+    # (mean over classes) for the multi-hot BCE heads, categorical entropy for
+    # the 2-way softmax hand_type head (whose max is also log2(2) = 1 bit).
+    # Low entropy = the head is confidently committing to a (sub)set of
+    # classes; high entropy = its per-frame prediction is closer to a coin
+    # flip. `entropy_by_head` lets each phonological property be inspected on
+    # its own; `entropy` averages across heads as a single "how confident is
+    # the model right now" trace, useful as a candidate segmentation /
+    # keyframe signal (see README) — note this is a diagnostic on the
+    # per-frame heads themselves, which bypass the trained attention pool
+    # (see predict_frames docstring), not a property the model was directly
+    # supervised on.
+    def _entropy(name, probs):
+        p = np.clip(probs, 1e-7, 1 - 1e-7)
+        if name == "hand_type":
+            return -(p * np.log2(p)).sum(axis=1)
+        return (-(p * np.log2(p) + (1 - p) * np.log2(1 - p))).mean(axis=1)
+
+    entropy_by_head = {name: _entropy(name, probs) for name, probs in heads_probs.items()}
+    entropy = np.mean(list(entropy_by_head.values()), axis=0)
+
     label_maps = {
         "shape": VOCAB["idx_to_shape"], "att": VOCAB["idx_to_att"],
         "cloc": VOCAB["idx_to_cloc"],   "ctype": VOCAB["idx_to_ctype"],
@@ -310,6 +332,8 @@ def api_clip_activations(idx):
             for name, probs in heads_probs.items()
         },
         "attn": _round_1d(attn),
+        "entropy": _round_1d(entropy),
+        "entropy_by_head": {name: _round_1d(h) for name, h in entropy_by_head.items()},
     }
     ACT_CACHE[idx] = result
     return jsonify(result)
@@ -665,7 +689,9 @@ function toggleSection(key) {
   collapseState[key] = !collapseState[key];
   document.getElementById('sec-' + key).classList.toggle('collapsed', collapseState[key]);
   if (!collapseState[key] && actData) {
-    if (key === 'attn') redrawAttn(); else redrawHeatmap(key);
+    if (key === 'attn') redrawAttn();
+    else if (key === 'entropy') redrawEntropy();
+    else redrawHeatmap(key);
   }
 }
 
@@ -897,9 +923,11 @@ kpToggle.addEventListener('change', async () => {
 function buildSections(keys) {
   const wrap = document.getElementById('sections');
   wrap.innerHTML = '';
-  keys.concat(['attn']).forEach(key => {
+  keys.concat(['attn', 'entropy']).forEach(key => {
     if (!(key in collapseState)) collapseState[key] = false;
-    const title = key === 'attn' ? 'Attention' : (HEAD_TITLES[key] || key);
+    const title = key === 'attn' ? 'Attention'
+                : key === 'entropy' ? 'Entropy (bits/class, mean over heads)'
+                : (HEAD_TITLES[key] || key);
     const sec = document.createElement('div');
     sec.className = 'act-section' + (collapseState[key] ? ' collapsed' : '');
     sec.id = 'sec-' + key;
@@ -946,7 +974,7 @@ async function selectClip(c) {
     actData  = await ra.json();
     headKeys = HEAD_ORDER.filter(k => k in actData.heads);
     buildSections(headKeys);
-    headKeys.concat(['attn']).forEach(key => {
+    headKeys.concat(['attn', 'entropy']).forEach(key => {
       document.getElementById('loading-' + key).style.display = 'none';
       document.getElementById('wrap-' + key).style.display = 'block';
     });
@@ -1059,7 +1087,12 @@ function drawHeatmap(canvasEl, headData, T) {
   drawPlayhead(ctx, totalH, plotH, W);
 }
 
-function drawAttn(canvasEl, attn, T) {
+// Generic filled line-plot for a single 1-D per-frame trace (attention
+// weights, entropy, ...). `fixedMax`, if given, pins the y-scale (e.g. 1.0
+// for a bits-per-class entropy trace, whose theoretical max is known) so it
+// reads consistently across clips instead of auto-scaling to each clip's own
+// peak.
+function drawLine1D(canvasEl, data, T, label, fixedMax, color) {
   const PLOT_H = 50;
   const totalH = PLOT_H + AXIS_H;
   const W      = canvasEl.width = canvasEl.offsetWidth;
@@ -1076,13 +1109,13 @@ function drawAttn(canvasEl, attn, T) {
   ctx.font         = '9px system-ui';
   ctx.textAlign    = 'right';
   ctx.textBaseline = 'middle';
-  ctx.fillText('attn', LABEL_W - 4, PLOT_H / 2);
+  ctx.fillText(label, LABEL_W - 4, PLOT_H / 2);
 
-  const maxVal = Math.max(...attn, 1e-9);
-  const norm   = attn.map(v => v / maxVal);
+  const maxVal = fixedMax != null ? fixedMax : Math.max(...data, 1e-9);
+  const norm   = data.map(v => Math.min(1, v / maxVal));
 
   const cellW = plotW / T;
-  ctx.fillStyle = 'steelblue';
+  ctx.fillStyle = color || 'steelblue';
   ctx.beginPath();
   ctx.moveTo(LABEL_W, PLOT_H);
   for (let t = 0; t < T; t++) {
@@ -1097,6 +1130,14 @@ function drawAttn(canvasEl, attn, T) {
 
   drawTimeAxis(ctx, W, totalH, PLOT_H, T);
   drawPlayhead(ctx, totalH, PLOT_H, W);
+}
+
+function drawAttn(canvasEl, attn, T) {
+  drawLine1D(canvasEl, attn, T, 'attn');
+}
+
+function drawEntropy(canvasEl, entropy, T) {
+  drawLine1D(canvasEl, entropy, T, 'H (bits)', 1.0, '#e9a544');
 }
 
 // ── redraw functions (check collapsed state) ──
@@ -1115,9 +1156,17 @@ function redrawAttn() {
   drawAttn(canvas, actData.attn, actData.T);
 }
 
+function redrawEntropy() {
+  if (collapseState['entropy'] || !actData) return;
+  const canvas = document.getElementById('canvas-entropy');
+  if (!canvas) return;
+  drawEntropy(canvas, actData.entropy, actData.T);
+}
+
 function redrawAll() {
   headKeys.forEach(k => redrawHeatmap(k));
   redrawAttn();
+  redrawEntropy();
 }
 
 // Redraw the active section's canvas when its container is resized.

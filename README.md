@@ -221,6 +221,18 @@ correctly. The overlay uses each clip's un-normalized pixel-space landmarks
 (a separate `/api/clip/<idx>/keypoints` endpoint), independent of the
 model-input streams used for the activation heatmaps.
 
+An "Entropy" section alongside the attention trace plots per-frame predictive
+entropy (bits/class, mean over classes for each multi-hot head so every head
+sits on the same 0–1 scale, then averaged across all active heads) — low
+values mean the per-frame heads are confidently committing to a (sub)set of
+classes, high values mean the prediction is closer to a coin flip. This is a
+diagnostic on the per-frame heads applied directly to fusion features, which
+bypass the trained attention pool (see `ClipInference.predict_frames`), not a
+quantity the model was directly supervised on. It's exposed as a candidate
+signal for keyframe/segmentation exploration; a per-head breakdown is
+available in the same API response (`entropy_by_head`) for clips where a
+single property's transitions are of interest.
+
 ---
 
 ## Training
