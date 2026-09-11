@@ -16,13 +16,13 @@ Eight phonological properties, trained from **per-clip labels** and queryable
 | Head | Target | Classes |
 |------|--------|---------|
 | shape (dom.) | multi-hot BCE | <details><summary>42 handshapes</summary>Flata handen · D-handen · Flata tumhanden · Sprethanden · 4-handen · Vinkelhanden · Tumvinkelhanden · A-handen · S-handen · Klohanden · O-handen · Knutna handen · E-handen · Tumhanden · Pekfingret · L-handen · Raka måtthanden · Nyphanden · Nyphanden (alt) · T-handen · Krokfingret · Måtthanden · Hållhanden · Långfingret · N-handen · Lilla O-handen · Lilla O-handen (alt) · V-handen · Tupphanden · K-handen · Dubbelkroken · Böjda tupphanden · M-handen · W-handen · Lillfingret · U-handen · Flyghanden · Stora långfingret · Runda långfingret · Stora nyphanden · Stora hållhanden · X-handen</details> |
-| att (dom.) | multi-hot BCE | <details><summary>34 orientations</summary>framåtriktad-framåtvänd · framåtriktad-högervänd · framåtriktad-inåtvänd · framåtriktad-nedåtvänd · framåtriktad-uppåtvänd · framåtriktad-vänstervänd · högerriktad-framåtvänd · högerriktad-högervänd · högerriktad-inåtvänd · högerriktad-nedåtvänd · högerriktad-uppåtvänd · högerriktad-vänstervänd · inåtriktad-högervänd · inåtriktad-inåtvänd · inåtriktad-nedåtvänd · inåtriktad-uppåtvänd · inåtriktad-vänstervänd · nedåtriktad-framåtvänd · nedåtriktad-högervänd · nedåtriktad-inåtvänd · nedåtriktad-nedåtvänd · nedåtriktad-uppåtvänd · nedåtriktad-vänstervänd · uppåtriktad-framåtvänd · uppåtriktad-högervänd · uppåtriktad-inåtvänd · uppåtriktad-uppåtvänd · uppåtriktad-vänstervänd · vänsterriktad-framåtvänd · vänsterriktad-högervänd · vänsterriktad-inåtvänd · vänsterriktad-nedåtvänd · vänsterriktad-uppåtvänd · vänsterriktad-vänstervänd</details> |
+| att (dom.) | multi-hot BCE | <details><summary>24 orientations</summary>framåtriktad-högervänd · framåtriktad-nedåtvänd · framåtriktad-uppåtvänd · framåtriktad-vänstervänd · högerriktad-framåtvänd · högerriktad-inåtvänd · högerriktad-nedåtvänd · högerriktad-uppåtvänd · inåtriktad-högervänd · inåtriktad-nedåtvänd · inåtriktad-uppåtvänd · inåtriktad-vänstervänd · nedåtriktad-framåtvänd · nedåtriktad-högervänd · nedåtriktad-inåtvänd · nedåtriktad-vänstervänd · uppåtriktad-framåtvänd · uppåtriktad-högervänd · uppåtriktad-inåtvänd · uppåtriktad-vänstervänd · vänsterriktad-framåtvänd · vänsterriktad-inåtvänd · vänsterriktad-nedåtvänd · vänsterriktad-uppåtvänd</details> |
 | contact_loc | multi-hot BCE | <details><summary>22 locations</summary>none · mouth · chin · nose · forehead · cheek · ear · top_of_head · face · head · neck · chest · stomach · hip · shoulder · upper_arm · forearm · elbow · wrist · other_hand · temple · back</details> |
 | contact_type | multi-hot BCE | <details><summary>4 types</summary>none · single · repeated · sustained</details> |
 | motion | multi-hot BCE | <details><summary>8 directions</summary>none · nedåt · uppåt · framåt · bakåt · åt_höger · åt_vänster · inåt</details> |
 | hand_type | CE | <details><summary>2 classes</summary>one · two</details> |
 | nondom_shape | multi-hot BCE | <details><summary>42 handshapes (optional)</summary>Same vocabulary as shape (dom.)</details> |
-| nondom_att | multi-hot BCE | <details><summary>34 orientations (optional)</summary>Same vocabulary as att (dom.)</details> |
+| nondom_att | multi-hot BCE | <details><summary>24 orientations (optional)</summary>Same vocabulary as att (dom.)</details> |
 
 Training uses one multi-hot target per clip — all properties that appear across
 any phase of the sign are active. At inference the same heads can be applied to
@@ -51,7 +51,7 @@ flowchart TD
 
     subgraph dom["Dominant"]
         h1["shape\n42  multi-hot BCE"]
-        h2["attitude\n34  multi-hot BCE"]
+        h2["attitude\n24  multi-hot BCE"]
     end
     subgraph shared["Shared"]
         h3["contact location\n22  multi-hot BCE"]
@@ -61,7 +61,7 @@ flowchart TD
     end
     subgraph nondom["Non-dominant  (optional)"]
         h7["shape\n42  multi-hot BCE"]
-        h8["attitude\n34  multi-hot BCE"]
+        h8["attitude\n24  multi-hot BCE"]
     end
 
     pool --> dom
