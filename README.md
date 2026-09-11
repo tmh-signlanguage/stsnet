@@ -294,19 +294,21 @@ SSLL phonological targets.
 
 ### Performance (MediaPipe baseline, SSLL val set)
 
-| Property | SSLL only | +mined SSLC |
-|----------|-----------|-------------|
-| Handshape (dom.) | 77.8% | **84.7%** |
-| Attitude (dom.) | 75.2% | **78.8%** |
-| Contact location | — | — |
-| Contact type | — | — |
-| Motion direction | — | — |
-| Hand type | 96.6% | **96.9%** |
-| Handshape (nondom.) | 80.7% | **86.2%** |
-| Attitude (nondom.) | 75.6% | **78.8%** |
+| Property | SSLL only | +mined SSLC (3D) | +mined SSLC (2D) |
+|----------|-----------|-----------------|-----------------|
+| Handshape (dom.) | 77.8% | **84.7%** | 82.2%† |
+| Attitude (dom.) | 75.2% | 78.8% | **79.2%**† |
+| Contact location | — | — | — |
+| Contact type | — | — | — |
+| Motion direction | — | — | — |
+| Hand type | 96.6% | 96.9% | **97.1%**† |
+| Handshape (nondom.) | 80.7% | **86.2%** | 83.8%† |
+| Attitude (nondom.) | 75.6% | 78.8% | **78.6%**† |
 
-SSLL-only = `clip_nd_att_base` (ep 29 best). +mined = `clip_nd_att_combined_v3` (17,833 SSLC clips, ep 60).
-Contact/motion accuracies not yet re-evaluated for this model series.
+SSLL-only = `clip_nd_att_base` (ep 29). 3D = `stsnet_v02.pt` / `clip_nd_att_combined_v3` (17,833 SSLC clips, ep 60).
+2D = `stsnet_v02_noz.pt` / `clip_nd_att_combined_v3_noz_reg` (same data, 2D xy only, ep 12 best-val).
+†Contact/motion not re-evaluated. Note: 2D ep-60 raw accuracy exceeds 3D on all heads (shape 85.5%, att 80.0%,
+nd_shape 86.1%, nd_att 79.3%) but those weights were not checkpointed (label-smoothing raises the val-loss floor).
 
 ---
 
@@ -334,7 +336,8 @@ scripts/
   predict.py                 CSV predictions + per-frame embeddings (stsnet-predict)
   inspector.py               interactive activation-heatmap web GUI (stsnet-inspect)
 checkpoints/
-  stsnet_v02.pt               pretrained v0.2 checkpoint (Git LFS)
+  stsnet_v02.pt               pretrained v0.2 checkpoint — 3D (xyz) input (Git LFS)
+  stsnet_v02_noz.pt           pretrained v0.2 checkpoint — 2D (xy only) input (Git LFS)
 data/
   sts_handformer.txt         handshape vocabulary (42 classes)
 v0.1/                        standalone v0.1 tree — own package, scripts, checkpoint, data
