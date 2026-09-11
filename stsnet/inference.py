@@ -19,9 +19,20 @@ class ClipClassifierInference:
     Args:
         checkpoint_path: Path to a best.pt checkpoint saved by scripts/train_clip.py.
         device:          Torch device string (e.g. "cpu", "cuda:0").
+        no_z:            Strip the z-coordinate from pose streams before inference.
+                         ``None`` (default) auto-detects from the checkpoint:
+                         2D models (n_dims=2) strip z automatically, 3D models
+                         keep all three coordinates.  Pass ``True`` to force 2D
+                         even on a 3D-trained model, or ``False`` to keep 3D
+                         regardless of the checkpoint.
     """
 
-    def __init__(self, checkpoint_path: str | Path, device: str = "cpu"):
+    def __init__(
+        self,
+        checkpoint_path: str | Path,
+        device: str = "cpu",
+        no_z: bool | None = None,
+    ):
         from stsnet.clip_classifier import ClipClassifier
         self.device = torch.device(device)
         self.model, self.vocab_meta = ClipClassifier.from_checkpoint(
@@ -29,6 +40,14 @@ class ClipClassifierInference:
         )
         self.model.to(self.device)
         self.model.eval()
+
+        # Determine whether to strip z: explicit override > checkpoint n_dims
+        ckpt_n_dims = self.vocab_meta.get("model_kwargs", {}).get("n_dims", 3)
+        if no_z is None:
+            self.no_z = (ckpt_n_dims == 2)
+        else:
+            self.no_z = bool(no_z)
+        self.n_dims = 2 if self.no_z else 3
 
         self._idx_to_shape  = {v: k for k, v in self.vocab_meta["shape_to_idx"].items()}
         self._idx_to_att    = {v: k for k, v in self.vocab_meta["att_to_idx"].items()}
@@ -43,7 +62,11 @@ class ClipClassifierInference:
         f0:          int = 0,
         f1:          int | None = None,
     ) -> dict[str, torch.Tensor] | None:
-        """Load pose streams, optionally sliced to [f0, f1), as (1, T, J, 3) tensors."""
+        """Load pose streams, optionally sliced to [f0, f1), as (1, T, J, C) tensors.
+
+        C is 2 when no_z is True (or the checkpoint was trained with n_dims=2),
+        otherwise C is 3.
+        """
         streams = load_pose_streams(Path(pose_path), handedness, mirror_left=True)
         if streams is None:
             return None
@@ -51,6 +74,8 @@ class ClipClassifierInference:
             streams = {k: v[f0:f1] for k, v in streams.items()}
         elif f0 > 0:
             streams = {k: v[f0:] for k, v in streams.items()}
+        if self.no_z:
+            streams = {k: v[..., :2] for k, v in streams.items()}
         return {
             k: torch.from_numpy(v).unsqueeze(0).to(self.device)
             for k, v in streams.items()

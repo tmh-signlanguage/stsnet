@@ -81,6 +81,9 @@ def main():
     ap.add_argument("--device", default="cpu",
                     help="Torch device (default: cpu; use cuda for GPU)")
     ap.add_argument("--handedness", default="right", choices=["right", "left"])
+    ap.add_argument("--no_z", action="store_true",
+                    help="Strip z-coordinate from pose streams (2D input). "
+                         "Auto-detected from the checkpoint when not given.")
     # Clip-level mode
     ap.add_argument("--sign_start", type=int, default=None,
                     help="First frame of signing window (clip-level mode)")
@@ -129,7 +132,10 @@ def main():
         print("Loading model...", end=" ", file=sys.stderr, flush=True)
         t0 = time.time()
         from stsnet.inference import ClipClassifierInference
-        model = ClipClassifierInference(ckpt_path, device=args.device)
+        model = ClipClassifierInference(
+            ckpt_path, device=args.device,
+            no_z=True if args.no_z else None,
+        )
         print(f"done ({time.time() - t0:.1f}s)", file=sys.stderr)
 
         # ── Predictions ──────────────────────────────────────────────────────

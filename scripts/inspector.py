@@ -46,6 +46,7 @@ MODEL   = None
 VOCAB: dict = {}                # idx_to_shape/att/motion/cloc/ctype
 DEVICE  = torch.device("cpu")
 HANDEDNESS = "right"
+NO_Z    = False                 # strip z-coordinate from pose streams
 ACT_CACHE: dict[int, dict] = {}
 KP_CACHE: dict[int, dict] = {}      # raw keypoint overlay data, see _load_raw_keypoints
 UPLOAD_DIR: Path | None = None      # where drag-and-dropped files are saved
@@ -250,6 +251,9 @@ def api_clip_activations(idx):
     streams = load_pose_streams(clip["pose_path"], HANDEDNESS, mirror_left=True)
     if streams is None:
         return jsonify({"error": "pose load failed"}), 500
+
+    if NO_Z:
+        streams = {k: v[..., :2] for k, v in streams.items()}
 
     dom    = torch.from_numpy(streams["dominant"]).unsqueeze(0).to(DEVICE)
     nondom = torch.from_numpy(streams["nondominant"]).unsqueeze(0).to(DEVICE)
@@ -1205,6 +1209,9 @@ def main():
     ap.add_argument("--ckpt", default="checkpoints/stsnet_v02.pt",
                     help="ClipClassifier checkpoint (default: checkpoints/stsnet_v02.pt)")
     ap.add_argument("--handedness", default="right", choices=["right", "left"])
+    ap.add_argument("--no_z", action="store_true",
+                    help="Strip z-coordinate from pose streams (2D input). "
+                         "Auto-detected from the checkpoint when not given.")
     ap.add_argument("--device", default="cpu",
                     help="Torch device (default: cpu; use cuda for GPU)")
     ap.add_argument("--pose_cache_dir", default=None,
@@ -1269,6 +1276,11 @@ def main():
     MODEL, vocab_meta = ClipClassifier.from_checkpoint(args.ckpt, map_location=str(DEVICE))
     MODEL.to(DEVICE)
     MODEL.eval()
+
+    # Determine whether to strip z: explicit --no_z > checkpoint n_dims
+    ckpt_n_dims = vocab_meta.get("model_kwargs", {}).get("n_dims", 3)
+    NO_Z = args.no_z or (ckpt_n_dims == 2)
+    print(f"Input mode: {'2D (xy only)' if NO_Z else '3D (xyz)'}")
 
     def _invert(d):
         return {v: k for k, v in d.items()}
