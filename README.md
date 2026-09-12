@@ -296,19 +296,17 @@ SSLL phonological targets.
 
 | Property | SSLL only | +mined SSLC (3D) | +mined SSLC (2D) |
 |----------|-----------|-----------------|-----------------|
-| Handshape (dom.) | 77.8% | **84.7%** | 82.2%† |
-| Attitude (dom.) | 75.2% | 78.8% | **79.2%**† |
+| Handshape (dom.) | 77.8% | **84.7%** | **85.3%** |
+| Attitude (dom.) | 75.2% | 78.8% | **80.1%** |
 | Contact location | — | — | — |
 | Contact type | — | — | — |
 | Motion direction | — | — | — |
-| Hand type | 96.6% | 96.9% | **97.1%**† |
-| Handshape (nondom.) | 80.7% | **86.2%** | 83.8%† |
-| Attitude (nondom.) | 75.6% | 78.8% | **78.6%**† |
+| Hand type | 96.6% | 96.9% | **97.2%** |
+| Handshape (nondom.) | 80.7% | **86.2%** | 85.4% |
+| Attitude (nondom.) | 75.6% | 78.8% | **79.2%** |
 
-SSLL-only = `clip_nd_att_base` (ep 29). 3D = `stsnet_v02.pt` / `clip_nd_att_combined_v3` (17,833 SSLC clips, ep 60).
-2D = `stsnet_v02_noz.pt` / `clip_nd_att_combined_v3_noz_reg` (same data, 2D xy only, ep 12 best-val).
-†Contact/motion not re-evaluated. Note: 2D ep-60 raw accuracy exceeds 3D on all heads (shape 85.5%, att 80.0%,
-nd_shape 86.1%, nd_att 79.3%) but those weights were not checkpointed (label-smoothing raises the val-loss floor).
+SSLL-only = `clip_nd_att_base` (ep 29). 3D = `stsnet_v02.pt` / `clip_nd_att_combined_v3` (17,833 SSLC clips, best-val checkpoint).
+2D = `stsnet_v02_noz.pt` / `clip_nd_att_combined_v3_noz_reg2` (same data, 2D xy only, ep 60 last checkpoint).
 
 ---
 
