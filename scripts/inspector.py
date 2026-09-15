@@ -13,6 +13,14 @@ progress indicator), and appear in the sidebar once ready.
 Usage:
     python scripts/inspector.py clip1.mp4 clip2.mp4 clip3.pose \\
         --ckpt checkpoints/stsnet_v02.pt
+
+Several checkpoints can be given to compare models frame by frame — every
+head section then shows one heatmap per model, stacked on a shared time axis
+with the same class rows, plus each model's per-frame argmax sequence:
+
+    python scripts/inspector.py clips/*.mp4 \\
+        --ckpt checkpoints/stsnet_v02_noz.pt runs/clip_mas_pool/last.pt \\
+        --names AP MAS
 """
 
 import argparse
@@ -42,11 +50,12 @@ UPLOAD_SUFFIXES = VIDEO_SUFFIXES | {".pose"}
 # ---------------------------------------------------------------------------
 CLIPS: list[dict] = []          # [{idx, name, video_path, pose_path, status}]
 CLIPS_LOCK = threading.Lock()   # guards CLIPS during background uploads
-MODEL   = None
-VOCAB: dict = {}                # idx_to_shape/att/motion/cloc/ctype
+# One entry per --ckpt: {name, model, vocab (idx_to_*), no_z, per_frame}
+# where per_frame is "softmax" for alignment-trained (MAS) heads and "sigmoid"
+# for attention-pooled BCE heads.
+MODELS: list[dict] = []
 DEVICE  = torch.device("cpu")
 HANDEDNESS = "right"
-NO_Z    = False                 # strip z-coordinate from pose streams
 ACT_CACHE: dict[int, dict] = {}
 KP_CACHE: dict[int, dict] = {}      # raw keypoint overlay data, see _load_raw_keypoints
 UPLOAD_DIR: Path | None = None      # where drag-and-dropped files are saved
@@ -244,16 +253,25 @@ def api_clip_activations(idx):
     clip = CLIPS[idx]
     if clip["pose_path"] is None:
         return jsonify({"error": "pose extraction failed for this clip"}), 400
-    if MODEL is None:
+    if not MODELS:
         return jsonify({"error": "no model loaded"}), 400
 
     from stsnet.data.pose_io import load_pose_streams
-    streams = load_pose_streams(clip["pose_path"], HANDEDNESS, mirror_left=True)
-    if streams is None:
+    streams3d = load_pose_streams(clip["pose_path"], HANDEDNESS, mirror_left=True)
+    if streams3d is None:
         return jsonify({"error": "pose load failed"}), 500
 
-    if NO_Z:
-        streams = {k: v[..., :2] for k, v in streams.items()}
+    T = next(iter(streams3d.values())).shape[0]
+    result = {"T": T, "models": [_model_activations(m, streams3d) for m in MODELS]}
+    ACT_CACHE[idx] = result
+    return jsonify(result)
+
+
+def _model_activations(entry: dict, streams3d: dict) -> dict:
+    """Per-frame head activations, attention trace and entropy for one model."""
+    model, vocab = entry["model"], entry["vocab"]
+    streams = ({k: v[..., :2] for k, v in streams3d.items()} if entry["no_z"]
+               else streams3d)
 
     dom    = torch.from_numpy(streams["dominant"]).unsqueeze(0).to(DEVICE)
     nondom = torch.from_numpy(streams["nondominant"]).unsqueeze(0).to(DEVICE)
@@ -264,30 +282,33 @@ def api_clip_activations(idx):
     T = dom.shape[1]
     full_t = torch.tensor([T], dtype=torch.long, device=DEVICE)
     zero_t = torch.zeros(1, dtype=torch.long, device=DEVICE)
+    softmax_heads = entry["per_frame"] == "softmax"
 
     with torch.no_grad():
-        frame_feats = MODEL.frame_features(dom, nondom, body, face)  # (1, T, D)
+        frame_feats = model.frame_features(dom, nondom, body, face)  # (1, T, D)
         f = frame_feats[0]
 
-        def _sigmoid_probs(head):
-            return torch.sigmoid(head(f)).cpu().numpy()
+        def _probs(head):
+            logits = head(f)
+            p = torch.softmax(logits, dim=-1) if softmax_heads else torch.sigmoid(logits)
+            return p.cpu().numpy()
 
         heads_probs = {
-            "shape":  _sigmoid_probs(MODEL.shape_head),
-            "att":    _sigmoid_probs(MODEL.att_head),
-            "cloc":   _sigmoid_probs(MODEL.cloc_head),
-            "ctype":  _sigmoid_probs(MODEL.ctype_head),
-            "motion": _sigmoid_probs(MODEL.motion_head),
-            "hand_type": torch.softmax(MODEL.hand_type_head(f), dim=-1).cpu().numpy(),
+            "shape":  _probs(model.shape_head),
+            "att":    _probs(model.att_head),
+            "cloc":   _probs(model.cloc_head),
+            "ctype":  _probs(model.ctype_head),
+            "motion": _probs(model.motion_head),
+            "hand_type": torch.softmax(model.hand_type_head(f), dim=-1).cpu().numpy(),
         }
-        if MODEL.has_nondom_shape:
-            heads_probs["nondom_shape"] = _sigmoid_probs(MODEL.nondom_shape_head)
-        if MODEL.has_nondom_att:
-            heads_probs["nondom_att"] = _sigmoid_probs(MODEL.nondom_att_head)
+        if model.has_nondom_shape:
+            heads_probs["nondom_shape"] = _probs(model.nondom_shape_head)
+        if model.has_nondom_att:
+            heads_probs["nondom_att"] = _probs(model.nondom_att_head)
 
         # Full forward (whole-clip attention window) for the attention trace.
-        out = MODEL(dom, nondom, body, face,
-                     sign_start=zero_t, sign_end=full_t, lengths=full_t)
+        out = model(dom, nondom, body, face,
+                    sign_start=zero_t, sign_end=full_t, lengths=full_t)
         attn = out["attn_weights"][0].cpu().numpy()  # (T,)
 
     def _round_list(arr):
@@ -298,36 +319,37 @@ def api_clip_activations(idx):
 
     # Per-frame predictive entropy, in bits-per-class so every head sits on the
     # same [0, 1] scale regardless of its number of classes: binary entropy
-    # (mean over classes) for the multi-hot BCE heads, categorical entropy for
-    # the 2-way softmax hand_type head (whose max is also log2(2) = 1 bit).
-    # Low entropy = the head is confidently committing to a (sub)set of
-    # classes; high entropy = its per-frame prediction is closer to a coin
-    # flip. `entropy_by_head` lets each phonological property be inspected on
-    # its own; `entropy` averages across heads as a single "how confident is
-    # the model right now" trace, useful as a candidate segmentation /
-    # keyframe signal (see README) — note this is a diagnostic on the
-    # per-frame heads themselves, which bypass the trained attention pool
-    # (see predict_frames docstring), not a property the model was directly
-    # supervised on.
+    # (mean over classes) for the multi-hot BCE heads; categorical entropy
+    # divided by log2(C) for softmax heads (hand_type, and every head of an
+    # alignment-trained model). Low entropy = the head is confidently
+    # committing to a (sub)set of classes; high entropy = its per-frame
+    # prediction is closer to a coin flip. `entropy_by_head` lets each
+    # phonological property be inspected on its own; `entropy` averages across
+    # heads as a single "how confident is the model right now" trace, useful
+    # as a candidate segmentation / keyframe signal (see README) — note this
+    # is a diagnostic on the per-frame heads themselves, which bypass the
+    # trained attention pool (see predict_frames docstring), not a property
+    # the model was directly supervised on.
     def _entropy(name, probs):
         p = np.clip(probs, 1e-7, 1 - 1e-7)
-        if name == "hand_type":
-            return -(p * np.log2(p)).sum(axis=1)
+        if name == "hand_type" or softmax_heads:
+            return -(p * np.log2(p)).sum(axis=1) / np.log2(p.shape[1])
         return (-(p * np.log2(p) + (1 - p) * np.log2(1 - p))).mean(axis=1)
 
     entropy_by_head = {name: _entropy(name, probs) for name, probs in heads_probs.items()}
     entropy = np.mean(list(entropy_by_head.values()), axis=0)
 
     label_maps = {
-        "shape": VOCAB["idx_to_shape"], "att": VOCAB["idx_to_att"],
-        "cloc": VOCAB["idx_to_cloc"],   "ctype": VOCAB["idx_to_ctype"],
-        "motion": VOCAB["idx_to_motion"],
+        "shape": vocab["idx_to_shape"], "att": vocab["idx_to_att"],
+        "cloc": vocab["idx_to_cloc"],   "ctype": vocab["idx_to_ctype"],
+        "motion": vocab["idx_to_motion"],
         "hand_type": {0: "one", 1: "two"},
-        "nondom_shape": VOCAB["idx_to_shape"], "nondom_att": VOCAB["idx_to_att"],
+        "nondom_shape": vocab["idx_to_shape"], "nondom_att": vocab["idx_to_att"],
     }
 
-    result = {
-        "T": T,
+    return {
+        "name": entry["name"],
+        "per_frame": entry["per_frame"],
         "heads": {
             name: {
                 "probs":  _round_list(probs),
@@ -339,8 +361,6 @@ def api_clip_activations(idx):
         "entropy": _round_1d(entropy),
         "entropy_by_head": {name: _round_1d(h) for name, h in entropy_by_head.items()},
     }
-    ACT_CACHE[idx] = result
-    return jsonify(result)
 
 
 @app.route("/api/clip/<int:idx>/keypoints")
@@ -583,7 +603,7 @@ video { max-height: 38vh; max-width: 100%; display: block; }
 .act-arrow { font-size: 10px; transition: transform 0.15s; }
 .act-section.collapsed .act-arrow { transform: rotate(-90deg); }
 .act-body {
-  max-height: 600px;
+  max-height: 1400px;
   overflow: hidden;
   transition: max-height 0.2s ease;
   background: #12192e;
@@ -593,6 +613,11 @@ video { max-height: 38vh; max-width: 100%; display: block; }
 .act-loading { font-size: 11px; color: #888; padding: 8px 0; }
 .canvas-wrap { width: 100%; }
 canvas.act-canvas { width: 100%; display: block; }
+.model-block + .model-block { margin-top: 6px; }
+.model-label {
+  font-size: 10px; font-weight: 600; color: #8fb3ff; letter-spacing: 0.3px;
+  padding: 1px 0 2px; text-transform: uppercase;
+}
 </style>
 </head>
 <body>
@@ -637,6 +662,7 @@ canvas.act-canvas { width: 100%; display: block; }
 const LABEL_W = 90;   // px for row label column
 const AXIS_H  = 18;   // px for time axis
 const ROW_H   = 14;   // px per class row in heatmap
+const SEQ_H   = 16;   // px for the per-frame argmax strip above each heatmap
 const N_SHOW  = __N_SHOW__;
 const HEAD_ORDER  = __HEAD_ORDER__;
 const HEAD_TITLES = __HEAD_TITLES__;
@@ -661,8 +687,9 @@ const HAND_CONNECTIONS = [
 // ── state ──────────────────────────────────────────────────────────────────
 let clips      = [];
 let activeIdx  = null;
-let actData    = null;   // current activations JSON
-let headKeys   = [];     // heads present in the current actData, in display order
+let actData    = null;   // current activations JSON ({T, models:[{name, heads, attn, entropy}]})
+let headKeys   = [];     // heads present in any model of the current actData, in display order
+let modelNames = [];     // display name per model, in actData.models order
 const collapseState = {};
 const uploads  = {};     // id -> {name, pct, error}  (in-flight browser→server uploads)
 const ALLOWED_UPLOAD_SUFFIXES = ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.pose'];
@@ -686,6 +713,15 @@ function ylOrRd(t) {
   const g = stops[lo][1] + f * (stops[hi][1] - stops[lo][1]);
   const b = stops[lo][2] + f * (stops[hi][2] - stops[lo][2]);
   return `rgb(${Math.round(r*255)},${Math.round(g*255)},${Math.round(b*255)})`;
+}
+
+// Stable per-label colour for the argmax strip (hash of the label string), so
+// the same class gets the same colour in every model and every clip.
+function labelColor(label) {
+  let h = 0;
+  for (let i = 0; i < label.length; i++) h = (h * 31 + label.charCodeAt(i)) >>> 0;
+  const hue = h % 360, sat = 55 + (h >> 9) % 25, lig = 42 + (h >> 14) % 18;
+  return `hsl(${hue},${sat}%,${lig}%)`;
 }
 
 // ── collapsible sections ───────────────────────────────────────────────────
@@ -924,14 +960,20 @@ kpToggle.addEventListener('change', async () => {
 });
 
 // ── sections DOM (built dynamically from the heads present) ────────────────
-function buildSections(keys) {
+function buildSections(keys, names) {
   const wrap = document.getElementById('sections');
   wrap.innerHTML = '';
+  const multi = names.length > 1;
   keys.concat(['attn', 'entropy']).forEach(key => {
     if (!(key in collapseState)) collapseState[key] = false;
     const title = key === 'attn' ? 'Attention'
                 : key === 'entropy' ? 'Entropy (bits/class, mean over heads)'
                 : (HEAD_TITLES[key] || key);
+    const blocks = names.map((n, m) => `
+      <div class="model-block">
+        ${multi ? `<div class="model-label">${n}</div>` : ''}
+        <div class="canvas-wrap" id="wrap-${key}-${m}" style="display:none"><canvas class="act-canvas" id="canvas-${key}-${m}"></canvas></div>
+      </div>`).join('');
     const sec = document.createElement('div');
     sec.className = 'act-section' + (collapseState[key] ? ' collapsed' : '');
     sec.id = 'sec-' + key;
@@ -941,7 +983,7 @@ function buildSections(keys) {
       </div>
       <div class="act-body">
         <div class="act-loading" id="loading-${key}">Loading…</div>
-        <div class="canvas-wrap" id="wrap-${key}" style="display:none"><canvas class="act-canvas" id="canvas-${key}"></canvas></div>
+        ${blocks}
       </div>`;
     wrap.appendChild(sec);
   });
@@ -965,8 +1007,8 @@ async function selectClip(c) {
     video.removeAttribute('src');
   }
 
-  // Placeholder sections until we know which heads this checkpoint has.
-  buildSections(headKeys.length ? headKeys : HEAD_ORDER);
+  // Placeholder sections until we know which heads the checkpoint(s) have.
+  buildSections(headKeys.length ? headKeys : HEAD_ORDER, modelNames.length ? modelNames : ['']);
 
   try {
     const ra = await fetch('/api/clip/' + c.idx + '/activations');
@@ -975,12 +1017,16 @@ async function selectClip(c) {
       document.querySelectorAll('.act-loading').forEach(el => el.textContent = 'Error: ' + (err.error || ra.status));
       return;
     }
-    actData  = await ra.json();
-    headKeys = HEAD_ORDER.filter(k => k in actData.heads);
-    buildSections(headKeys);
+    actData    = await ra.json();
+    modelNames = actData.models.map(m => m.name);
+    headKeys   = HEAD_ORDER.filter(k => actData.models.some(m => k in m.heads));
+    buildSections(headKeys, modelNames);
     headKeys.concat(['attn', 'entropy']).forEach(key => {
       document.getElementById('loading-' + key).style.display = 'none';
-      document.getElementById('wrap-' + key).style.display = 'block';
+      actData.models.forEach((m, i) => {
+        const w = document.getElementById(`wrap-${key}-${i}`);
+        if (w && (key === 'attn' || key === 'entropy' || key in m.heads)) w.style.display = 'block';
+      });
     });
     redrawAll();
   } catch (e) {
@@ -1035,36 +1081,33 @@ function drawPlayhead(ctx, H, axisY, W) {
   ctx.closePath(); ctx.fill();
 }
 
-// Pick which class rows to show: highest max-activation first, up to nShow.
-function pickRows(probs, nShow, pinFirst) {
-  const T = probs.length;
-  const C = probs[0].length;
-  const maxAct = new Array(C).fill(0);
-  for (let t = 0; t < T; t++)
-    for (let c = 0; c < C; c++)
-      if (probs[t][c] > maxAct[c]) maxAct[c] = probs[t][c];
-
-  const pinned = pinFirst != null ? [pinFirst] : [];
-  const others = [];
-  for (let c = 0; c < C; c++)
-    if (c !== pinFirst) others.push(c);
-  others.sort((a, b) => maxAct[b] - maxAct[a]);
-
+// Pick which class rows to show for a head, shared across all models so the
+// heatmaps line up: labels ranked by their max activation in *any* model,
+// up to nShow, with `pinFirst` (a label) always in row 0 when given.
+function pickRowLabels(headDatas, nShow, pinFirst) {
+  const maxAct = {};
+  headDatas.forEach(hd => {
+    if (!hd) return;
+    const probs = hd.probs, labels = hd.labels;
+    for (let c = 0; c < labels.length; c++) {
+      let m = 0;
+      for (let t = 0; t < probs.length; t++) if (probs[t][c] > m) m = probs[t][c];
+      if (!(labels[c] in maxAct) || m > maxAct[labels[c]]) maxAct[labels[c]] = m;
+    }
+  });
+  const others = Object.keys(maxAct).filter(l => l !== pinFirst)
+                       .sort((a, b) => maxAct[b] - maxAct[a]);
+  const pinned = (pinFirst != null && pinFirst in maxAct) ? [pinFirst] : [];
   return [...pinned, ...others].slice(0, nShow);
 }
 
-function drawHeatmap(canvasEl, headData, T) {
-  const headKey = canvasEl.id.replace('canvas-', '');
-  const nShow   = N_SHOW[headKey] || 14;
+function drawHeatmap(canvasEl, headData, T, rowLabels) {
   const probs   = headData.probs;   // (T, C)
   const labels  = headData.labels;  // C
+  const idxOf   = {};
+  labels.forEach((l, i) => { idxOf[l] = i; });
 
-  // pin "none" (index 0) as first row for cloc/ctype/motion so the
-  // no-activity case is always visible.
-  const pinFirst = (headKey === 'motion' || headKey === 'cloc' || headKey === 'ctype') ? 0 : null;
-  const rows = pickRows(probs, nShow, pinFirst);
-
-  const plotH = rows.length * ROW_H;
+  const plotH  = SEQ_H + rowLabels.length * ROW_H;
   const totalH = plotH + AXIS_H;
   const W = canvasEl.width = canvasEl.offsetWidth;
   canvasEl.height = totalH;
@@ -1072,19 +1115,50 @@ function drawHeatmap(canvasEl, headData, T) {
   const ctx   = canvasEl.getContext('2d');
   const plotW = W - LABEL_W;
   ctx.clearRect(0, 0, W, totalH);
-
   const cellW = plotW / T;
-  rows.forEach((ci, ri) => {
-    const y0 = ri * ROW_H;
-    for (let t = 0; t < T; t++) {
-      ctx.fillStyle = ylOrRd(probs[t][ci]);
-      ctx.fillRect(LABEL_W + t * cellW, y0, Math.ceil(cellW), ROW_H);
+
+  // Argmax strip: one colour block per run of identical per-frame argmax,
+  // labelled when the run is wide enough. This is the model's frame-level
+  // phase sequence — what the MAS objective supervises directly.
+  const am = probs.map(row => { let b = 0; for (let c = 1; c < row.length; c++) if (row[c] > row[b]) b = c; return b; });
+  ctx.textBaseline = 'middle';
+  for (let t = 0; t < T;) {
+    let e = t; while (e < T && am[e] === am[t]) e++;
+    const lab = labels[am[t]] || String(am[t]);
+    const x0 = LABEL_W + t * cellW, w = (e - t) * cellW;
+    ctx.fillStyle = labelColor(lab);
+    ctx.fillRect(x0, 0, Math.ceil(w), SEQ_H - 2);
+    if (w > 22) {
+      ctx.fillStyle = 'rgba(255,255,255,0.92)';
+      ctx.font = 'bold 9px system-ui';
+      ctx.textAlign = 'left';
+      ctx.save(); ctx.beginPath(); ctx.rect(x0, 0, w, SEQ_H); ctx.clip();
+      ctx.fillText(lab, x0 + 3, (SEQ_H - 2) / 2);
+      ctx.restore();
     }
-    ctx.fillStyle    = 'rgba(200,200,200,0.45)';
+    t = e;
+  }
+  ctx.fillStyle = 'rgba(200,200,200,0.45)';
+  ctx.font = '9px system-ui'; ctx.textAlign = 'right';
+  ctx.fillText('argmax', LABEL_W - 4, (SEQ_H - 2) / 2);
+
+  rowLabels.forEach((lab, ri) => {
+    const y0 = SEQ_H + ri * ROW_H;
+    const ci = idxOf[lab];
+    if (ci == null) {                      // class absent from this model's vocab
+      ctx.fillStyle = '#1b2440';
+      ctx.fillRect(LABEL_W, y0, plotW, ROW_H);
+    } else {
+      for (let t = 0; t < T; t++) {
+        ctx.fillStyle = ylOrRd(probs[t][ci]);
+        ctx.fillRect(LABEL_W + t * cellW, y0, Math.ceil(cellW), ROW_H);
+      }
+    }
+    ctx.fillStyle    = ci == null ? 'rgba(200,200,200,0.2)' : 'rgba(200,200,200,0.45)';
     ctx.font         = '9px system-ui';
     ctx.textAlign    = 'right';
     ctx.textBaseline = 'middle';
-    ctx.fillText(labels[ci] || String(ci), LABEL_W - 4, y0 + ROW_H / 2);
+    ctx.fillText(lab, LABEL_W - 4, y0 + ROW_H / 2);
   });
 
   drawTimeAxis(ctx, W, totalH, plotH, T);
@@ -1147,24 +1221,32 @@ function drawEntropy(canvasEl, entropy, T) {
 // ── redraw functions (check collapsed state) ──
 function redrawHeatmap(key) {
   if (collapseState[key] || !actData) return;
-  const canvas = document.getElementById('canvas-' + key);
-  const head   = actData.heads[key];
-  if (!canvas || !head) return;
-  drawHeatmap(canvas, head, actData.T);
+  const datas = actData.models.map(m => m.heads[key] || null);
+  // pin "none" as first row for cloc/ctype/motion so the no-activity case is
+  // always visible.
+  const pinFirst = (key === 'motion' || key === 'cloc' || key === 'ctype') ? 'none' : null;
+  const rows = pickRowLabels(datas, N_SHOW[key] || 14, pinFirst);
+  datas.forEach((hd, i) => {
+    const canvas = document.getElementById(`canvas-${key}-${i}`);
+    if (!canvas || !hd) return;
+    drawHeatmap(canvas, hd, actData.T, rows);
+  });
 }
 
 function redrawAttn() {
   if (collapseState['attn'] || !actData) return;
-  const canvas = document.getElementById('canvas-attn');
-  if (!canvas) return;
-  drawAttn(canvas, actData.attn, actData.T);
+  actData.models.forEach((m, i) => {
+    const canvas = document.getElementById(`canvas-attn-${i}`);
+    if (canvas) drawAttn(canvas, m.attn, actData.T);
+  });
 }
 
 function redrawEntropy() {
   if (collapseState['entropy'] || !actData) return;
-  const canvas = document.getElementById('canvas-entropy');
-  if (!canvas) return;
-  drawEntropy(canvas, actData.entropy, actData.T);
+  actData.models.forEach((m, i) => {
+    const canvas = document.getElementById(`canvas-entropy-${i}`);
+    if (canvas) drawEntropy(canvas, m.entropy, actData.T);
+  });
 }
 
 function redrawAll() {
@@ -1199,19 +1281,22 @@ def index():
 # ---------------------------------------------------------------------------
 
 def main():
-    global CLIPS, MODEL, VOCAB, DEVICE, HANDEDNESS, UPLOAD_DIR, POSE_CACHE_DIR
+    global CLIPS, MODELS, DEVICE, HANDEDNESS, UPLOAD_DIR, POSE_CACHE_DIR
 
     ap = argparse.ArgumentParser(
         description="Interactive STS-Net v0.2 activation inspector")
     ap.add_argument("videos", nargs="*", default=[],
                     help="Video (.mp4, .mov, ...) or .pose files to inspect "
                          "(more can be added later by dragging them into the browser)")
-    ap.add_argument("--ckpt", default="checkpoints/stsnet_v02.pt",
-                    help="ClipClassifier checkpoint (default: checkpoints/stsnet_v02.pt)")
+    ap.add_argument("--ckpt", nargs="+", default=["checkpoints/stsnet_v02.pt"],
+                    help="ClipClassifier checkpoint(s); give several to compare models "
+                         "side by side (default: checkpoints/stsnet_v02.pt)")
+    ap.add_argument("--names", nargs="+", default=None,
+                    help="Display name per --ckpt (default: parent dir / file stem)")
     ap.add_argument("--handedness", default="right", choices=["right", "left"])
     ap.add_argument("--no_z", action="store_true",
-                    help="Strip z-coordinate from pose streams (2D input). "
-                         "Auto-detected from the checkpoint when not given.")
+                    help="Strip z-coordinate from pose streams (2D input) for every model. "
+                         "Auto-detected per checkpoint when not given.")
     ap.add_argument("--device", default="cpu",
                     help="Torch device (default: cpu; use cuda for GPU)")
     ap.add_argument("--pose_cache_dir", default=None,
@@ -1267,29 +1352,46 @@ def main():
     n_ok = sum(1 for c in CLIPS if c["pose_path"] is not None)
     print(f"  {n_ok}/{len(CLIPS)} clips ready")
 
-    # ── 2. Load ClipClassifier checkpoint ────────────────────────────────────
+    # ── 2. Load ClipClassifier checkpoint(s) ────────────────────────────────
     DEVICE = torch.device(
         args.device if (args.device != "cuda" or torch.cuda.is_available()) else "cpu"
     )
-    print(f"Loading ClipClassifier from {args.ckpt} on {DEVICE}…")
     from stsnet.clip_classifier import ClipClassifier
-    MODEL, vocab_meta = ClipClassifier.from_checkpoint(args.ckpt, map_location=str(DEVICE))
-    MODEL.to(DEVICE)
-    MODEL.eval()
-
-    # Determine whether to strip z: explicit --no_z > checkpoint n_dims
-    ckpt_n_dims = vocab_meta.get("model_kwargs", {}).get("n_dims", 3)
-    NO_Z = args.no_z or (ckpt_n_dims == 2)
-    print(f"Input mode: {'2D (xy only)' if NO_Z else '3D (xyz)'}")
 
     def _invert(d):
         return {v: k for k, v in d.items()}
 
-    VOCAB["idx_to_shape"]  = _invert(vocab_meta.get("shape_to_idx",  {}))
-    VOCAB["idx_to_att"]    = _invert(vocab_meta.get("att_to_idx",    {}))
-    VOCAB["idx_to_motion"] = _invert(vocab_meta.get("motion_to_idx", {}))
-    VOCAB["idx_to_cloc"]   = _invert(vocab_meta.get("cloc_to_idx",   {}))
-    VOCAB["idx_to_ctype"]  = _invert(vocab_meta.get("ctype_to_idx",  {}))
+    names = args.names or []
+    if names and len(names) != len(args.ckpt):
+        sys.exit(f"--names has {len(names)} entries but --ckpt has {len(args.ckpt)}")
+    for i, ckpt in enumerate(args.ckpt):
+        print(f"Loading ClipClassifier from {ckpt} on {DEVICE}…")
+        model, vocab_meta = ClipClassifier.from_checkpoint(ckpt, map_location=str(DEVICE))
+        model.to(DEVICE)
+        model.eval()
+
+        # Strip z: explicit --no_z > checkpoint n_dims
+        ckpt_n_dims = vocab_meta.get("model_kwargs", {}).get("n_dims", 3)
+        no_z = args.no_z or (ckpt_n_dims == 2)
+        # Alignment-trained (MAS) heads are softmax per frame; AP heads are BCE.
+        objective = vocab_meta.get("objective", "ap")
+        per_frame = "softmax" if objective.startswith("mas") else "sigmoid"
+
+        p = Path(ckpt)
+        name = names[i] if names else (p.parent.name if p.parent.name not in ("", ".", "checkpoints")
+                                       else p.stem)
+        MODELS.append({
+            "name": name, "model": model, "no_z": no_z, "per_frame": per_frame,
+            "vocab": {
+                "idx_to_shape":  _invert(vocab_meta.get("shape_to_idx",  {})),
+                "idx_to_att":    _invert(vocab_meta.get("att_to_idx",    {})),
+                "idx_to_motion": _invert(vocab_meta.get("motion_to_idx", {})),
+                "idx_to_cloc":   _invert(vocab_meta.get("cloc_to_idx",   {})),
+                "idx_to_ctype":  _invert(vocab_meta.get("ctype_to_idx",  {})),
+            },
+        })
+        print(f"  [{name}] input: {'2D (xy only)' if no_z else '3D (xyz)'}  "
+              f"objective: {objective}  per-frame: {per_frame}")
 
     print(f"\nStarting Inspector on http://{args.host}:{args.port}/")
     app.run(host=args.host, port=args.port, debug=False, threaded=True)

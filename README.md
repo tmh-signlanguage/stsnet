@@ -213,6 +213,23 @@ optional, so the server can also be started empty (`python scripts/inspector.py
 saved under `--upload_dir` (default: a temp directory); pass `--no_upload`
 to disable the feature.
 
+**Comparing models.** Pass several checkpoints to `--ckpt` (with optional
+`--names`) to inspect two or more models on the same clips:
+
+```bash
+python scripts/inspector.py clip1.mp4 clip2.mp4 \
+    --ckpt checkpoints/stsnet_v02_noz.pt runs/clip_mas_pool/last.pt \
+    --names AP MAS
+```
+
+Each head section then stacks one heatmap per model on a shared time axis,
+with the same class rows (chosen by label across all models, so differing
+vocabularies still line up) and, above each heatmap, that model's per-frame
+argmax strip — its decoded phase sequence. Per-frame probabilities are
+sigmoid for attention-pooled (BCE) checkpoints and softmax for
+alignment-trained (`objective: mas_*`) ones, read from the checkpoint's
+`vocab_meta`. 2D/3D input is likewise detected per checkpoint.
+
 A "Show keypoints" toggle above the video overlays the raw MediaPipe Holistic
 landmarks (body pose, both hands, and a reduced set of face points) directly
 on the video frame, color-coded per stream and synced to the playhead —
