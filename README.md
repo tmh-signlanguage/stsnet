@@ -218,7 +218,7 @@ to disable the feature.
 
 ```bash
 python scripts/inspector.py clip1.mp4 clip2.mp4 \
-    --ckpt checkpoints/stsnet_v02_noz.pt runs/clip_mas_pool/last.pt \
+    --ckpt checkpoints/stsnet_v02_noz.pt checkpoints/stsnet_v02_mas.pt \
     --names AP MAS
 ```
 
@@ -311,19 +311,51 @@ SSLL phonological targets.
 
 ### Performance (MediaPipe baseline, SSLL val set)
 
-| Property | SSLL only | +mined SSLC (3D) | +mined SSLC (2D) |
-|----------|-----------|-----------------|-----------------|
-| Handshape (dom.) | 77.8% | **84.7%** | **85.3%** |
-| Attitude (dom.) | 75.2% | 78.8% | **80.1%** |
-| Contact location | — | — | — |
-| Contact type | — | — | — |
-| Motion direction | — | — | — |
-| Hand type | 96.6% | 96.9% | **97.2%** |
-| Handshape (nondom.) | 80.7% | **86.2%** | 85.4% |
-| Attitude (nondom.) | 75.6% | 78.8% | **79.2%** |
+Clip-level accuracy (top-1 prediction ∈ the clip's label set), all clips:
+
+| Property | SSLL only | +mined SSLC (3D) | +mined SSLC (2D) | 2D + monotonic alignment |
+|----------|-----------|-----------------|-----------------|------------------------|
+| Handshape (dom.) | 77.8% | 84.7% | 85.4% | **88.0%** |
+| Attitude (dom.) | 75.2% | 78.8% | **80.2%** | 78.9% |
+| Contact location | — | — | **80.4%** | 79.1% |
+| Contact type | — | — | **75.8%** | 70.9% |
+| Motion direction | — | — | **64.2%** | 58.9% |
+| Hand type | 96.6% | 96.9% | **97.3%** | 95.0% |
+| Handshape (nondom.) | 80.7% | 86.2% | 86.0% | **87.5%** |
+| Attitude (nondom.) | 75.6% | 78.8% | 79.2% | **79.4%** |
 
 SSLL-only = `clip_nd_att_base` (ep 29). 3D = `stsnet_v02.pt` / `clip_nd_att_combined_v3` (17,833 SSLC clips, best-val checkpoint).
 2D = `stsnet_v02_noz.pt` / `clip_nd_att_combined_v3_noz_reg2` (same data, 2D xy only, ep 60 last checkpoint).
+2D + monotonic alignment = `stsnet_v02_mas.pt` / `clip_mas_pool` (see below).
+
+#### Per-frame phase sequences: `stsnet_v02_mas.pt`
+
+The attention-pooled models are trained on the *set* of properties in a clip and
+ignore their order, so their per-frame heads (`predict_frames`) flicker and carry
+no phase structure. `stsnet_v02_mas.pt` has the same architecture, data and
+input (2D) but was trained with a **monotonic alignment** between the sign-window
+frames and the *ordered* phases of the dictionary description (Viterbi /
+Monotonic Alignment Search, then per-frame cross-entropy on the aligned phase
+labels), jointly with the usual pooled objective. It is a drop-in replacement
+for `stsnet_v02_noz.pt` in every script: `predict_phonology` / `embed_clip` use
+its (trained) attention pool, `predict_frames` gives temporally coherent,
+ordered phase predictions.
+
+Handshape phase-sequence metrics on SSLL val (per-frame argmax in the sign
+window, run-length decoded, vs. the ordered phases from the description;
+n = 4043 clips, 1320 of them multi-phase):
+
+| | `stsnet_v02_noz.pt` (AP) | `stsnet_v02_mas.pt` |
+|---|---|---|
+| exact sequence match, all clips | 2.7% | **46.5%** |
+| exact sequence match, multi-phase clips | 0.9% | **29.1%** |
+| normalised edit distance ↓ | 0.646 | **0.317** |
+| last phase correct, multi-phase clips | 4.8% | **72.8%** |
+| phase-count error (MAE, phases) | 2.43 | **0.95** |
+
+Same picture for attitude, contact location and motion. Use `stsnet_v02_mas.pt`
+whenever the per-frame output matters; `stsnet_v02_noz.pt` remains ~1–5 pts
+better on clip-level attitude / contact / motion / hand type.
 
 ---
 
@@ -353,6 +385,7 @@ scripts/
 checkpoints/
   stsnet_v02.pt               pretrained v0.2 checkpoint — 3D (xyz) input (Git LFS)
   stsnet_v02_noz.pt           pretrained v0.2 checkpoint — 2D (xy only) input (Git LFS)
+  stsnet_v02_mas.pt           v0.2, 2D, monotonic-alignment trained: ordered per-frame phases (Git LFS)
 data/
   sts_handformer.txt         handshape vocabulary (42 classes)
 v0.1/                        standalone v0.1 tree — own package, scripts, checkpoint, data

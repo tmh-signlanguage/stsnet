@@ -8,6 +8,7 @@ build/
 checkpoints/*
 !checkpoints/stsnet_v02.pt
 !checkpoints/stsnet_v02_noz.pt
+!checkpoints/stsnet_v02_mas.pt
 v0.1/checkpoints/*
 !v0.1/checkpoints/stsnet_base.pt
 logs/*.log
