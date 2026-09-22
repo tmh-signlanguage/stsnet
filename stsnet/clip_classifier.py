@@ -225,9 +225,18 @@ class ClipClassifier(nn.Module):
             model:      ClipClassifier in eval mode
             vocab_meta: dict with *_to_idx mappings
         """
-        ck = torch.load(ckpt_path, map_location=map_location)
-        kw = ck["vocab_meta"]["model_kwargs"]
+        ck = torch.load(ckpt_path, map_location=map_location, weights_only=False)
+        kw = dict(ck["vocab_meta"]["model_kwargs"])
         kw["streams"] = tuple(kw["streams"])
+        # Research checkpoints may carry kwargs this release does not implement
+        # (e.g. tf_layers for the temporal-transformer variant); drop zero/False
+        # ones silently, refuse anything that would change the architecture.
+        import inspect
+        known = set(inspect.signature(cls.__init__).parameters)
+        extra = {k: v for k, v in kw.items() if k not in known}
+        if any(v not in (0, False, None) for v in extra.values()):
+            raise ValueError(f"checkpoint needs unsupported model options: {extra}")
+        kw = {k: v for k, v in kw.items() if k in known}
         model = cls(**kw)
         model.load_state_dict(ck["model_state_dict"])
         model.eval()
