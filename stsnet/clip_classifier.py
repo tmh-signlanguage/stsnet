@@ -234,8 +234,8 @@ class ClipClassifier(nn.Module):
         import inspect
         known = set(inspect.signature(cls.__init__).parameters)
         extra = {k: v for k, v in kw.items() if k not in known}
-        if any(v not in (0, False, None) for v in extra.values()):
-            raise ValueError(f"checkpoint needs unsupported model options: {extra}")
+        if extra.get("tf_layers", 0):
+            raise ValueError(f"checkpoint needs the temporal-transformer variant (not in this release): {extra}")
         kw = {k: v for k, v in kw.items() if k in known}
         model = cls(**kw)
         model.load_state_dict(ck["model_state_dict"])
