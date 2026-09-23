@@ -400,3 +400,11 @@ per frame and supports Viterbi forced alignment for timeline annotation. It is
 a separate, incompatible package rooted at [`v0.1/`](v0.1/) — see
 [v0.1/README.md](v0.1/README.md) for full documentation and the pretrained
 checkpoint at `v0.1/checkpoints/stsnet_base.pt`.
+
+---
+
+## Publication
+
+Jonas Beskow, *STS-net — a phonological property prediction model for Swedish
+sign language*. Nordic Prosody XIV, Stockholm, 18–20 August 2026.
+[PDF](docs/stsnet_nordic_prosody_26.pdf)
