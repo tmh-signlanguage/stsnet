@@ -57,7 +57,6 @@ from scripts.inspector import (
 # ---------------------------------------------------------------------------
 
 CKPT_PATH      = os.environ.get("STSNET_CKPT", "checkpoints/stsnet_v02_mas.pt")
-HANDEDNESS     = "right"
 MAX_DURATION_S = float(os.environ.get("STSNET_MAX_DURATION", 20))
 DEVICE         = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 VIDEO_ELEM_ID  = "stsnet_video"
@@ -220,6 +219,12 @@ def _render_head_png(probs: np.ndarray, rows: list[int]) -> str:
 #    dropped file falling through to the browser's default "open as a new
 #    page" behavior when it lands outside (or Gradio's own drop-zone isn't
 #    live for) the video component.
+# Each heatmap row gets a fixed pixel height, shared by its label and its
+# image cells. Letting the image height follow its width (aspect ratio) made
+# rows shorter than the label text on narrow (phone) screens, so the label
+# column grew taller than the image and rows drifted out of alignment.
+ROW_PX = 18
+
 HEAD_EXTRA = f"""
 <style>
   .stsnet-head {{ border: 1px solid rgba(128,128,128,0.4); border-radius: 8px;
@@ -227,12 +232,15 @@ HEAD_EXTRA = f"""
   .stsnet-head summary {{ cursor: pointer; padding: 8px 12px; font-weight: 600;
                            background: rgba(128,128,128,0.12); list-style: revert; }}
   .stsnet-panel {{ display: flex; align-items: stretch; }}
-  .stsnet-labels {{ flex: 0 0 150px; display: flex; flex-direction: column; }}
-  .stsnet-labels span {{ flex: 1; display: flex; align-items: center; justify-content: flex-end;
-                          font-size: 11px; padding-right: 6px; white-space: nowrap;
-                          overflow: hidden; text-overflow: ellipsis; }}
+  .stsnet-labels {{ flex: 0 0 150px; display: flex; flex-direction: column; min-width: 0; }}
+  .stsnet-labels span {{ flex: 1 1 0; min-height: 0; display: block; text-align: right;
+                          font-size: 11px; line-height: {ROW_PX}px; padding-right: 6px;
+                          white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+  @media (max-width: 600px) {{ .stsnet-labels {{ flex-basis: 96px; }}
+                               .stsnet-labels span {{ font-size: 10px; }} }}
   .stsnet-imgwrap {{ position: relative; flex: 1 1 auto; line-height: 0; min-width: 0; }}
-  .stsnet-imgwrap img {{ width: 100%; display: block; }}
+  .stsnet-imgwrap img {{ width: 100%; height: 100%; display: block;
+                          image-rendering: pixelated; }}
   .stsnet-playhead {{ position: absolute; top: 0; bottom: 0; left: 0; width: 2px;
                        background: #e94560; pointer-events: none; }}
   #stsnet-seek {{ width: 100%; margin: 4px 0 10px; accent-color: #e94560; }}
@@ -314,7 +322,7 @@ def _render_streams_html(model_out: dict, fps: float) -> str:
         sections.append(
             f'<details{open_attr} class="stsnet-head">'
             f'<summary>{HEAD_TITLES.get(h, h)}</summary>'
-            f'<div class="stsnet-panel">'
+            f'<div class="stsnet-panel" style="height:{len(rows) * ROW_PX}px">'
             f'<div class="stsnet-labels">{label_spans}</div>'
             f'<div class="stsnet-imgwrap"><img src="{img_uri}" draggable="false">'
             f'<div class="stsnet-playhead"></div></div>'
@@ -373,7 +381,7 @@ def _run_model(streams3d: dict):
     return _model_activations(MODEL_ENTRY, streams3d)
 
 
-def run_demo(uploaded_path, show_overlay, prev_workdir, progress=gr.Progress()):
+def run_demo(uploaded_path, show_overlay, left_dominant, prev_workdir, progress=gr.Progress()):
     if prev_workdir and os.path.isdir(prev_workdir):
         shutil.rmtree(prev_workdir, ignore_errors=True)
 
@@ -400,7 +408,8 @@ def run_demo(uploaded_path, show_overlay, prev_workdir, progress=gr.Progress()):
         raise gr.Error("Pose extraction failed for this video (no readable video stream?).")
 
     progress(0.5, desc="Loading pose streams...")
-    streams3d = load_pose_streams(pose_path, HANDEDNESS, mirror_left=True)
+    streams3d = load_pose_streams(pose_path, "left" if left_dominant else "right",
+                                  mirror_left=True)
     if streams3d is None:
         raise gr.Error("Could not load landmarks from this video — was a signer visible on camera?")
 
@@ -460,6 +469,7 @@ with gr.Blocks(title="STS-Net Demo", head=HEAD_EXTRA) as demo:
                       label="Upload a sign-language clip, record one with your webcam, or drop one here")
     with gr.Row():
         overlay_toggle = gr.Checkbox(value=True, label="Show MediaPipe keypoint overlay")
+        left_toggle = gr.Checkbox(value=False, label="Mirror (dominant hand is left)")
         # Once `video` holds a result, dropping a replacement file onto it is
         # unreliable (Gradio's own drop-zone for Video doesn't consistently
         # stay live once the component has a value) — this button is a
@@ -506,7 +516,7 @@ with gr.Blocks(title="STS-Net Demo", head=HEAD_EXTRA) as demo:
 
     run_btn.click(
         fn=run_demo,
-        inputs=[uploaded_state, overlay_toggle, workdir_state],
+        inputs=[uploaded_state, overlay_toggle, left_toggle, workdir_state],
         outputs=[video, streams_out, plain_state, overlay_state, workdir_state],
         concurrency_limit=1,
     )
