@@ -1,0 +1,405 @@
+"""
+STS-Net demo — Gradio app for Hugging Face Spaces.
+
+Upload a short sign-language video; the app extracts MediaPipe Holistic
+pose, runs it through STS-Net v0.2 (ClipClassifier), and shows the same
+per-frame streams as scripts/inspector.py: a keypoint-overlay video, the
+clip-level prediction per head (from the trained attention pool), per-frame
+activation heatmaps for every head, the attention trace, and the predictive-
+entropy trace.
+
+Deployed from the `demo/` directory of github.com/jbeskow/stsnet — see
+demo/README.md for the exact file layout uploaded to the Space.
+"""
+
+import os
+import subprocess
+import tempfile
+import shutil
+from pathlib import Path
+
+import cv2
+import gradio as gr
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import mediapipe as mp
+import numpy as np
+import torch
+
+from stsnet.clip_classifier import ClipClassifier
+from stsnet.data.pose_io import load_pose_streams
+
+import scripts.inspector as inspector
+from scripts.inspector import (
+    extract_pose,
+    _model_activations,
+    _load_raw_keypoints,
+    HEAD_TITLES,
+    HEAD_ORDER,
+    N_SHOW,
+)
+
+# ---------------------------------------------------------------------------
+# Model (loaded once at startup)
+# ---------------------------------------------------------------------------
+
+CKPT_PATH      = os.environ.get("STSNET_CKPT", "checkpoints/stsnet_v02.pt")
+HANDEDNESS     = "right"
+MAX_DURATION_S = float(os.environ.get("STSNET_MAX_DURATION", 20))
+DEVICE         = torch.device("cpu")
+inspector.DEVICE = DEVICE   # _model_activations reads this module-level global
+
+
+def _invert(d: dict) -> dict:
+    return {v: k for k, v in d.items()}
+
+
+print(f"Loading ClipClassifier from {CKPT_PATH}...")
+_model, _vocab_meta = ClipClassifier.from_checkpoint(CKPT_PATH, map_location=str(DEVICE))
+_model.to(DEVICE)
+_model.eval()
+
+_ckpt_n_dims = _vocab_meta.get("model_kwargs", {}).get("n_dims", 3)
+_objective   = _vocab_meta.get("objective", "ap")
+
+MODEL_ENTRY = {
+    "name": Path(CKPT_PATH).stem,
+    "model": _model,
+    "no_z": _ckpt_n_dims == 2,
+    "per_frame": "softmax" if _objective.startswith("mas") else "sigmoid",
+    "vocab": {
+        "idx_to_shape":  _invert(_vocab_meta.get("shape_to_idx",  {})),
+        "idx_to_att":    _invert(_vocab_meta.get("att_to_idx",    {})),
+        "idx_to_motion": _invert(_vocab_meta.get("motion_to_idx", {})),
+        "idx_to_cloc":   _invert(_vocab_meta.get("cloc_to_idx",   {})),
+        "idx_to_ctype":  _invert(_vocab_meta.get("ctype_to_idx",  {})),
+    },
+}
+print(f"  input: {'2D (xy only)' if MODEL_ENTRY['no_z'] else '3D (xyz)'}  "
+      f"objective: {_objective}  per-frame: {MODEL_ENTRY['per_frame']}")
+
+LABEL_MAPS = {
+    "shape": MODEL_ENTRY["vocab"]["idx_to_shape"], "att": MODEL_ENTRY["vocab"]["idx_to_att"],
+    "cloc": MODEL_ENTRY["vocab"]["idx_to_cloc"],   "ctype": MODEL_ENTRY["vocab"]["idx_to_ctype"],
+    "motion": MODEL_ENTRY["vocab"]["idx_to_motion"],
+    "hand_type": {0: "one", 1: "two"},
+    "nondom_shape": MODEL_ENTRY["vocab"]["idx_to_shape"], "nondom_att": MODEL_ENTRY["vocab"]["idx_to_att"],
+}
+
+# ---------------------------------------------------------------------------
+# Keypoint overlay drawing (same topology/colors as the inspector's JS)
+# ---------------------------------------------------------------------------
+
+_POSE_CONN = mp.solutions.pose.POSE_CONNECTIONS
+_HAND_CONN = mp.solutions.hands.HAND_CONNECTIONS
+
+# Matches scripts/inspector.py's drawKeypoints() stream colors (hex -> BGR).
+_STREAM_STYLE = {
+    "pose":       ((197, 209, 79),  _POSE_CONN, 3),
+    "face":       ((96, 192, 240),  None,       1),
+    "left_hand":  ((96, 69, 233),   _HAND_CONN, 2),
+    "right_hand": ((255, 169, 90),  _HAND_CONN, 2),
+}
+
+
+def _draw_overlay(frame: np.ndarray, kp: dict, t: int) -> np.ndarray:
+    for stream, (color, connections, radius) in _STREAM_STYLE.items():
+        pts = kp[stream][t]
+        if connections:
+            for a, b in connections:
+                pa, pb = pts[a], pts[b]
+                if pa is not None and pb is not None:
+                    cv2.line(frame, (int(pa[0]), int(pa[1])), (int(pb[0]), int(pb[1])),
+                              color, 1, cv2.LINE_AA)
+        for p in pts:
+            if p is not None:
+                cv2.circle(frame, (int(p[0]), int(p[1])), radius, color, -1, cv2.LINE_AA)
+    return frame
+
+
+def _build_overlay_video(src_video: Path, kp: dict, out_path: Path, progress=None) -> None:
+    cap = cv2.VideoCapture(str(src_video))
+    fps    = cap.get(cv2.CAP_PROP_FPS) or kp["fps"]
+    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))  or kp["width"]
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or kp["height"]
+    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or kp["T"]
+
+    cmd = [
+        "ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
+        "-s", f"{width}x{height}", "-r", str(fps), "-i", "-",
+        "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
+        str(out_path),
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.PIPE)
+    try:
+        t = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            kt = min(t + kp["frame_offset"], kp["T"] - 1)
+            _draw_overlay(frame, kp, kt)
+            proc.stdin.write(frame.tobytes())
+            t += 1
+            if progress is not None and n_frames:
+                progress(min(1.0, t / n_frames))
+    finally:
+        cap.release()
+        proc.stdin.close()
+        stderr = proc.stderr.read()
+        ret = proc.wait()
+    if ret != 0:
+        raise RuntimeError(f"ffmpeg failed: {stderr.decode(errors='replace')[-800:]}")
+
+
+# ---------------------------------------------------------------------------
+# Clip-level prediction (trained attention pool, not the per-frame probe)
+# ---------------------------------------------------------------------------
+
+def _clip_predictions(streams3d: dict) -> dict[str, list[tuple[str, float]]]:
+    model, no_z = MODEL_ENTRY["model"], MODEL_ENTRY["no_z"]
+    softmax_heads = MODEL_ENTRY["per_frame"] == "softmax"
+    streams = ({k: v[..., :2] for k, v in streams3d.items()} if no_z else streams3d)
+
+    dom    = torch.from_numpy(streams["dominant"]).unsqueeze(0).to(DEVICE)
+    nondom = torch.from_numpy(streams["nondominant"]).unsqueeze(0).to(DEVICE)
+    body   = torch.from_numpy(streams["body"]).unsqueeze(0).to(DEVICE)
+    face   = torch.from_numpy(streams["face"]).unsqueeze(0).to(DEVICE) if "face" in streams else None
+    T = dom.shape[1]
+    full_t = torch.tensor([T], dtype=torch.long, device=DEVICE)
+    zero_t = torch.zeros(1, dtype=torch.long, device=DEVICE)
+
+    with torch.no_grad():
+        out = model(dom, nondom, body, face, sign_start=zero_t, sign_end=full_t, lengths=full_t)
+
+    def _top(head: str, multi_hot: bool) -> list[tuple[str, float]]:
+        logits = out[f"{head}_logits"][0]
+        p = (torch.softmax(logits, -1) if (softmax_heads or not multi_hot) else torch.sigmoid(logits))
+        p = p.cpu().numpy()
+        lm = LABEL_MAPS[head]
+        if multi_hot and not softmax_heads:
+            idxs = [i for i in range(len(p)) if p[i] > 0.5] or [int(p.argmax())]
+        else:
+            idxs = [int(p.argmax())]
+        idxs = sorted(idxs, key=lambda i: -p[i])[:5]
+        return [(lm.get(i, str(i)), float(p[i])) for i in idxs]
+
+    preds = {
+        "shape":  _top("shape",  True),
+        "att":    _top("att",    True),
+        "cloc":   _top("cloc",   True),
+        "ctype":  _top("ctype",  True),
+        "motion": _top("motion", True),
+        "hand_type": _top("hand_type", False),
+    }
+    if model.has_nondom_shape:
+        preds["nondom_shape"] = _top("nondom_shape", True)
+    if model.has_nondom_att:
+        preds["nondom_att"] = _top("nondom_att", True)
+    return preds
+
+
+def _format_summary_md(preds: dict[str, list[tuple[str, float]]]) -> str:
+    lines = ["| Property | Prediction (clip-level) |", "|---|---|"]
+    for head in HEAD_ORDER:
+        if head not in preds:
+            continue
+        vals = ", ".join(f"{label} ({p:.0%})" for label, p in preds[head])
+        lines.append(f"| **{HEAD_TITLES.get(head, head)}** | {vals} |")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Per-frame streams figure (heatmaps + attention + entropy)
+# ---------------------------------------------------------------------------
+
+def _pick_rows(probs: np.ndarray, n_show: int, pin_first: int | None) -> list[int]:
+    C = probs.shape[1]
+    max_act = probs.max(axis=0)
+    others = [c for c in range(C) if c != pin_first]
+    others.sort(key=lambda c: -max_act[c])
+    rows = ([pin_first] if pin_first is not None else []) + others
+    return rows[:n_show]
+
+
+def _render_streams_figure(model_out: dict) -> plt.Figure:
+    T = model_out["T"] if "T" in model_out else len(model_out["attn"])
+    present = [h for h in HEAD_ORDER if h in model_out["heads"]]
+
+    panels = []   # (title, kind, data...)
+    for h in present:
+        probs  = np.array(model_out["heads"][h]["probs"])
+        labels = model_out["heads"][h]["labels"]
+        pin    = 0 if h in ("motion", "cloc", "ctype") else None
+        rows   = _pick_rows(probs, N_SHOW.get(h, 10), pin)
+        panels.append((HEAD_TITLES.get(h, h), "heat", probs, labels, rows))
+    panels.append(("Attention", "line", np.array(model_out["attn"]), "steelblue", None))
+    panels.append(("Entropy (bits)", "line", np.array(model_out["entropy"]), "#e9a544", (0, 1)))
+
+    heights = [max(2, len(p[4])) if p[1] == "heat" else 3 for p in panels]
+    fig, axes = plt.subplots(
+        len(panels), 1, figsize=(11, sum(heights) * 0.26 + 1.2), sharex=True,
+        gridspec_kw={"height_ratios": heights},
+    )
+    if len(panels) == 1:
+        axes = [axes]
+
+    for ax, (title, kind, *data) in zip(axes, panels):
+        if kind == "heat":
+            probs, labels, rows = data
+            ax.imshow(probs[:, rows].T, aspect="auto", cmap="YlOrRd", vmin=0, vmax=1,
+                       interpolation="nearest", extent=[0, T, len(rows), 0])
+            ax.set_yticks(np.arange(len(rows)) + 0.5)
+            ax.set_yticklabels([labels[r] for r in rows], fontsize=6.5)
+            ax.set_ylim(len(rows), 0)
+        else:
+            series, color, ylim = data
+            ax.fill_between(range(T), series, color=color, alpha=0.35)
+            ax.plot(series, color=color, linewidth=1)
+            if ylim:
+                ax.set_ylim(*ylim)
+            ax.set_yticks([])
+        ax.set_ylabel(title, fontsize=8.5, rotation=0, ha="right", va="center", labelpad=55)
+        ax.tick_params(axis="y", length=0)
+        for spine in ("top", "right"):
+            ax.spines[spine].set_visible(False)
+
+    axes[-1].set_xlabel("Frame")
+    axes[-1].set_xlim(0, T)
+    fig.tight_layout()
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# ffprobe helpers
+# ---------------------------------------------------------------------------
+
+def _probe_duration(video_path: Path) -> float | None:
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
+            capture_output=True, timeout=10,
+        )
+        return float(result.stdout.decode().strip())
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Gradio callback
+# ---------------------------------------------------------------------------
+
+def run_demo(video_path, show_overlay, prev_workdir, progress=gr.Progress()):
+    if prev_workdir and os.path.isdir(prev_workdir):
+        shutil.rmtree(prev_workdir, ignore_errors=True)
+
+    if not video_path:
+        raise gr.Error("Please upload a video first.")
+    video_path = Path(video_path)
+
+    progress(0.0, desc="Checking video...")
+    duration = _probe_duration(video_path)
+    if duration is None:
+        raise gr.Error("Could not read this video file.")
+    if duration > MAX_DURATION_S:
+        raise gr.Error(
+            f"This clip is {duration:.1f}s long; the demo is limited to "
+            f"{MAX_DURATION_S:.0f}s so it stays responsive on shared CPU hardware. "
+            "Please trim it and try again."
+        )
+
+    workdir = Path(tempfile.mkdtemp(prefix="stsnet_demo_"))
+    pose_path = workdir / "clip.pose"
+
+    progress(0.05, desc="Extracting MediaPipe pose...")
+    if not extract_pose(video_path, pose_path):
+        raise gr.Error("Pose extraction failed for this video (no readable video stream?).")
+
+    progress(0.5, desc="Loading pose streams...")
+    streams3d = load_pose_streams(pose_path, HANDEDNESS, mirror_left=True)
+    if streams3d is None:
+        raise gr.Error("Could not load landmarks from this video — was a signer visible on camera?")
+
+    progress(0.6, desc="Running STS-Net...")
+    model_out = _model_activations(MODEL_ENTRY, streams3d)
+    preds = _clip_predictions(streams3d)
+
+    progress(0.75, desc="Rendering activation plots...")
+    fig = _render_streams_figure(model_out)
+
+    progress(0.85, desc="Rendering keypoint overlay...")
+    kp = _load_raw_keypoints(pose_path, video_path)
+    overlay_path = workdir / "overlay.mp4"
+    _build_overlay_video(video_path, kp, overlay_path,
+                          progress=lambda f: progress(0.85 + 0.14 * f, desc="Rendering keypoint overlay..."))
+
+    progress(1.0, desc="Done")
+    summary_md = _format_summary_md(preds)
+    display = str(overlay_path) if show_overlay else str(video_path)
+    return display, summary_md, fig, str(video_path), str(overlay_path), str(workdir)
+
+
+def toggle_overlay(show_overlay, plain_path, overlay_path):
+    if not plain_path:
+        return gr.update()
+    return overlay_path if show_overlay else plain_path
+
+
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
+
+DESCRIPTION = """
+# STS-Net — Swedish Sign Language phonology
+
+Upload a short clip of someone signing and this model will predict eight
+phonological properties (handshape, orientation, contact location/type,
+motion direction, one-/two-handedness) and show how its per-frame
+confidence evolves across the clip — the same streams as the project's
+local `stsnet-inspect` tool.
+
+Clips are capped at **{max_s:.0f} seconds** to keep this CPU-only Space
+responsive. Pose is extracted with MediaPipe Holistic; nothing is stored
+after your results are shown. See the
+[GitHub repo](https://github.com/jbeskow/stsnet) for training code, model
+details, and the full desktop inspector.
+""".format(max_s=MAX_DURATION_S)
+
+with gr.Blocks(title="STS-Net Demo") as demo:
+    gr.Markdown(DESCRIPTION)
+
+    plain_state   = gr.State()
+    overlay_state = gr.State()
+    workdir_state = gr.State()
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            video_in = gr.Video(label="Upload a sign-language clip", sources=["upload"])
+            overlay_toggle = gr.Checkbox(value=True, label="Show MediaPipe keypoint overlay")
+            run_btn = gr.Button("Analyze", variant="primary")
+        with gr.Column(scale=1):
+            video_out = gr.Video(label="Video", interactive=False)
+            summary_out = gr.Markdown()
+
+    streams_out = gr.Plot(label="Per-frame streams: activations · attention · entropy")
+
+    run_btn.click(
+        fn=run_demo,
+        inputs=[video_in, overlay_toggle, workdir_state],
+        outputs=[video_out, summary_out, streams_out, plain_state, overlay_state, workdir_state],
+        concurrency_limit=1,
+    )
+    overlay_toggle.change(
+        fn=toggle_overlay,
+        inputs=[overlay_toggle, plain_state, overlay_state],
+        outputs=[video_out],
+    )
+
+demo.queue(max_size=8)
+
+if __name__ == "__main__":
+    demo.launch()
