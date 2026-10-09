@@ -20,8 +20,10 @@ per-frame diagnostic streams as the project's desktop inspector: per-head
 activation heatmaps, the trained attention trace, and a predictive-entropy
 trace.
 
-Clips are capped to keep this CPU-only Space responsive; nothing uploaded is
-stored beyond the current session.
+Runs on a free ZeroGPU Space (shared GPU attached only for the model's
+forward pass; pose extraction runs on CPU). Clips are capped to stay within
+the daily free GPU quota; nothing uploaded is stored beyond the current
+session.
 
 Code, training scripts, and the full desktop inspector (`stsnet-inspect`,
 which supports comparing multiple checkpoints side by side) live at

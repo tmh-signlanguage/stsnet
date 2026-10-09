@@ -10,6 +10,12 @@ entropy trace.
 
 Deployed from the `demo/` directory of github.com/jbeskow/stsnet — see
 demo/README.md for the exact file layout uploaded to the Space.
+
+Runs on a free ZeroGPU Space: the model forward pass (the only real torch
+compute — pose extraction is a CPU subprocess) is wrapped in `_run_model`,
+decorated with `@spaces.GPU` so it gets a real GPU attached for that call.
+`spaces.GPU` is a no-op outside the ZeroGPU runtime, so this also runs
+unmodified on CPU for local development.
 """
 
 import os
@@ -26,6 +32,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import mediapipe as mp
 import numpy as np
+import spaces
 import torch
 
 from stsnet.clip_classifier import ClipClassifier
@@ -48,7 +55,7 @@ from scripts.inspector import (
 CKPT_PATH      = os.environ.get("STSNET_CKPT", "checkpoints/stsnet_v02.pt")
 HANDEDNESS     = "right"
 MAX_DURATION_S = float(os.environ.get("STSNET_MAX_DURATION", 20))
-DEVICE         = torch.device("cpu")
+DEVICE         = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 inspector.DEVICE = DEVICE   # _model_activations reads this module-level global
 
 
@@ -293,6 +300,11 @@ def _probe_duration(video_path: Path) -> float | None:
 # Gradio callback
 # ---------------------------------------------------------------------------
 
+@spaces.GPU(duration=30)
+def _run_model(streams3d: dict):
+    return _model_activations(MODEL_ENTRY, streams3d), _clip_predictions(streams3d)
+
+
 def run_demo(video_path, show_overlay, prev_workdir, progress=gr.Progress()):
     if prev_workdir and os.path.isdir(prev_workdir):
         shutil.rmtree(prev_workdir, ignore_errors=True)
@@ -308,8 +320,8 @@ def run_demo(video_path, show_overlay, prev_workdir, progress=gr.Progress()):
     if duration > MAX_DURATION_S:
         raise gr.Error(
             f"This clip is {duration:.1f}s long; the demo is limited to "
-            f"{MAX_DURATION_S:.0f}s so it stays responsive on shared CPU hardware. "
-            "Please trim it and try again."
+            f"{MAX_DURATION_S:.0f}s so it stays responsive and within this "
+            "free Space's daily GPU quota. Please trim it and try again."
         )
 
     workdir = Path(tempfile.mkdtemp(prefix="stsnet_demo_"))
@@ -325,8 +337,7 @@ def run_demo(video_path, show_overlay, prev_workdir, progress=gr.Progress()):
         raise gr.Error("Could not load landmarks from this video — was a signer visible on camera?")
 
     progress(0.6, desc="Running STS-Net...")
-    model_out = _model_activations(MODEL_ENTRY, streams3d)
-    preds = _clip_predictions(streams3d)
+    model_out, preds = _run_model(streams3d)
 
     progress(0.75, desc="Rendering activation plots...")
     fig = _render_streams_figure(model_out)

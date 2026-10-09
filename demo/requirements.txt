@@ -1,7 +1,8 @@
 # Pinned to the versions this demo was built and tested against.
-# torch is pulled from the CPU wheel index to keep the Space image small —
-# this Space has no GPU.
---extra-index-url https://download.pytorch.org/whl/cpu
+# Standard (CUDA-enabled) torch build — required for ZeroGPU Spaces, which
+# attach a real GPU inside @spaces.GPU-decorated calls. `spaces` makes that
+# decorator a no-op outside the ZeroGPU runtime, so this also installs and
+# runs fine for local CPU development.
 
 torch==2.8.0
 numpy==1.26.4
@@ -11,3 +12,4 @@ pose-format==0.12.3
 mediapipe==0.10.21
 matplotlib==3.10.8
 gradio==5.49.1
+spaces==0.51.3
