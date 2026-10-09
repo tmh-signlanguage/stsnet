@@ -20,6 +20,7 @@ unmodified on CPU (or a local GPU) for development.
 """
 
 import base64
+import html
 import os
 import subprocess
 import tempfile
@@ -174,17 +175,24 @@ def _pick_rows(probs: np.ndarray, n_show: int, pin_first: int | None) -> list[in
     return rows[:n_show]
 
 
-def _render_head_png(probs: np.ndarray, labels: list[str], rows: list[int]) -> str:
+def _render_head_png(probs: np.ndarray, rows: list[int]) -> str:
+    """Heatmap cells only — no axis, ticks or labels, and the Axes forced to
+    fill the figure edge-to-edge (subplots_adjust to 0/1 margins). Row labels
+    are rendered separately as an HTML sidebar (see _render_streams_html):
+    baking variable-width label text into the image, as an earlier version
+    did via ax.set_yticklabels + tight_layout, made the left margin (and so
+    where x=0 actually falls in the image) depend on each head's longest
+    label string — since different heads' label vocabularies have very
+    different lengths, the playhead line (positioned as a plain left:X% of
+    the image) was correct for some heads and visibly offset for others.
+    An image that is always exactly the plot area, with no per-head-dependent
+    margin, is what makes a single left:X% rule correct for every head.
+    """
     fig, ax = plt.subplots(figsize=(10, max(1.0, len(rows) * 0.3)))
     ax.imshow(probs[:, rows].T, aspect="auto", cmap="YlOrRd", vmin=0, vmax=1,
                interpolation="nearest")
-    ax.set_yticks(range(len(rows)))
-    ax.set_yticklabels([labels[r] for r in rows], fontsize=8)
-    ax.set_xticks([])
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-    ax.tick_params(axis="y", length=0)
-    fig.tight_layout(pad=0.3)
+    ax.axis("off")
+    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
 
     buf = BytesIO()
     fig.savefig(buf, format="png", dpi=110)
@@ -218,8 +226,13 @@ HEAD_EXTRA = f"""
                   margin-bottom: 8px; overflow: hidden; }}
   .stsnet-head summary {{ cursor: pointer; padding: 8px 12px; font-weight: 600;
                            background: rgba(128,128,128,0.12); list-style: revert; }}
-  .stsnet-panel {{ position: relative; line-height: 0; }}
-  .stsnet-panel img {{ width: 100%; display: block; }}
+  .stsnet-panel {{ display: flex; align-items: stretch; }}
+  .stsnet-labels {{ flex: 0 0 150px; display: flex; flex-direction: column; }}
+  .stsnet-labels span {{ flex: 1; display: flex; align-items: center; justify-content: flex-end;
+                          font-size: 11px; padding-right: 6px; white-space: nowrap;
+                          overflow: hidden; text-overflow: ellipsis; }}
+  .stsnet-imgwrap {{ position: relative; flex: 1 1 auto; line-height: 0; min-width: 0; }}
+  .stsnet-imgwrap img {{ width: 100%; display: block; }}
   .stsnet-playhead {{ position: absolute; top: 0; bottom: 0; left: 0; width: 2px;
                        background: #e94560; pointer-events: none; }}
   #stsnet-seek {{ width: 100%; margin: 4px 0 10px; accent-color: #e94560; }}
@@ -292,14 +305,20 @@ def _render_streams_html(model_out: dict, fps: float) -> str:
         labels = model_out["heads"][h]["labels"]
         pin    = 0 if h in ("motion", "cloc", "ctype") else None
         rows   = _pick_rows(probs, N_SHOW.get(h, 10), pin)
-        img_uri = _render_head_png(probs, labels, rows)
+        img_uri = _render_head_png(probs, rows)
+        label_spans = "".join(
+            f'<span title="{html.escape(labels[r])}">{html.escape(labels[r])}</span>'
+            for r in rows
+        )
         open_attr = " open" if h == "shape" else ""
         sections.append(
             f'<details{open_attr} class="stsnet-head">'
             f'<summary>{HEAD_TITLES.get(h, h)}</summary>'
-            f'<div class="stsnet-panel"><img src="{img_uri}" draggable="false">'
+            f'<div class="stsnet-panel">'
+            f'<div class="stsnet-labels">{label_spans}</div>'
+            f'<div class="stsnet-imgwrap"><img src="{img_uri}" draggable="false">'
             f'<div class="stsnet-playhead"></div></div>'
-            f'</details>'
+            f'</div></details>'
         )
     return "".join(sections)
 
