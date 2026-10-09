@@ -6,6 +6,10 @@ Phonological property prediction for Swedish Sign Language (STS) from pose keypo
 v0.1 and v0.2 are incompatible model families and live in separate trees.
 For the v0.1 per-frame BiLSTM model see [v0.1/README.md](v0.1/README.md).
 
+**[Try it in your browser](https://huggingface.co/spaces/jbeskow/stsnet-demo)** —
+upload a clip and see the per-frame streams below without installing
+anything (Gradio Space on free ZeroGPU hardware; see [`demo/`](demo/)).
+
 ---
 
 ## What it predicts
@@ -187,6 +191,13 @@ range for per-frame output), `--handedness`, `--device`.
 ---
 
 ## Interactive inspector
+
+For a no-install version with a single video, see the
+[hosted demo](https://huggingface.co/spaces/jbeskow/stsnet-demo)
+(`demo/`) — it shows the clip-level prediction, the MediaPipe keypoint
+overlay, and the same per-frame heatmap/attention/entropy streams as the
+tool below, for one upload at a time. For browsing a local batch of clips or
+comparing checkpoints side by side, run the desktop inspector:
 
 `scripts/inspector.py` (`stsnet-inspect`) is a small Flask web GUI for
 browsing predictions on a handful of clips: a file list, a video player, and
