@@ -328,6 +328,7 @@ def _render_streams_html(model_out: dict, fps: float) -> str:
 # ---------------------------------------------------------------------------
 
 def _probe_duration(video_path: Path) -> float | None:
+    result = None
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -335,8 +336,32 @@ def _probe_duration(video_path: Path) -> float | None:
             capture_output=True, timeout=10,
         )
         return float(result.stdout.decode().strip())
-    except Exception:
+    except Exception as e:
+        size = video_path.stat().st_size if video_path.exists() else None
+        detail = (f"stdout={result.stdout[-300:]!r} stderr={result.stderr[-500:]!r}"
+                  if result is not None else repr(e))
+        print(f"ffprobe failed for {video_path} (size={size}): {detail}")
         return None
+
+
+def _normalize_recording(src: Path) -> Path | None:
+    """Browser MediaRecorder output (webm, or fragmented MP4 on iOS) is a
+    streamed, variable-frame-rate file that often has no container duration
+    and that OpenCV reads unreliably. Re-encode to a plain constant-rate
+    H.264 MP4 (ffmpeg also applies any rotation metadata here)."""
+    out = Path(tempfile.mkdtemp(prefix="stsnet_rec_")) / "webcam.mp4"
+    cmd = [
+        "ffmpeg", "-y", "-i", str(src), "-an",
+        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-r", "30",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "20",
+        "-movflags", "+faststart", str(out),
+    ]
+    result = subprocess.run(cmd, capture_output=True, timeout=120)
+    if result.returncode != 0 or not out.exists() or out.stat().st_size == 0:
+        print(f"ffmpeg normalize failed for {src} (size={src.stat().st_size}): "
+              f"{result.stderr.decode(errors='replace')[-800:]}")
+        return None
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -463,10 +488,19 @@ with gr.Blocks(title="STS-Net Demo", head=HEAD_EXTRA) as demo:
     streams_out = gr.HTML()
 
     video.upload(fn=_on_upload, inputs=video, outputs=[uploaded_state, clip_name_out])
+    def _on_record(path):
+        if not path:
+            return None, ""
+        fixed = _normalize_recording(Path(path))
+        if fixed is None:
+            raise gr.Error("Could not process this webcam recording — please try again, "
+                           "or record with your camera app and upload the file.")
+        return str(fixed), "### Webcam recording"
+
     # Webcam recordings never fire `upload` (that's reserved for the Upload
     # widget) — only `stop_recording`, once the recorded blob has been
     # saved server-side, so this is the equivalent hook for that path.
-    video.stop_recording(fn=_on_upload, inputs=video, outputs=[uploaded_state, clip_name_out])
+    video.stop_recording(fn=_on_record, inputs=video, outputs=[uploaded_state, clip_name_out])
     new_clip_btn.upload(fn=lambda p: (p,) + _on_upload(p),
                          inputs=new_clip_btn, outputs=[video, uploaded_state, clip_name_out])
 
