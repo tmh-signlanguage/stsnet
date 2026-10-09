@@ -2,11 +2,12 @@
 STS-Net demo — Gradio app for Hugging Face Spaces.
 
 Upload a short sign-language video; the app extracts MediaPipe Holistic
-pose, runs it through STS-Net v0.2 (ClipClassifier), and shows the same
-per-frame streams as scripts/inspector.py: a keypoint-overlay video, the
-clip-level prediction per head (from the trained attention pool), per-frame
-activation heatmaps for every head, the attention trace, and the predictive-
-entropy trace.
+pose, runs it through STS-Net v0.2 (`stsnet_v02_mas.pt`, the monotonic-
+alignment checkpoint — ordered, temporally coherent per-frame predictions
+rather than the flickering per-frame output of the attention-pooled
+checkpoint), and shows the same per-frame activation heatmaps as
+scripts/inspector.py, one collapsible pane per head, plus a MediaPipe
+keypoint overlay on the video.
 
 Deployed from the `demo/` directory of github.com/jbeskow/stsnet — see
 demo/README.md for the exact file layout uploaded to the Space.
@@ -15,13 +16,15 @@ Runs on a free ZeroGPU Space: the model forward pass (the only real torch
 compute — pose extraction is a CPU subprocess) is wrapped in `_run_model`,
 decorated with `@spaces.GPU` so it gets a real GPU attached for that call.
 `spaces.GPU` is a no-op outside the ZeroGPU runtime, so this also runs
-unmodified on CPU for local development.
+unmodified on CPU (or a local GPU) for development.
 """
 
+import base64
 import os
 import subprocess
 import tempfile
 import shutil
+from io import BytesIO
 from pathlib import Path
 
 import cv2
@@ -52,10 +55,11 @@ from scripts.inspector import (
 # Model (loaded once at startup)
 # ---------------------------------------------------------------------------
 
-CKPT_PATH      = os.environ.get("STSNET_CKPT", "checkpoints/stsnet_v02.pt")
+CKPT_PATH      = os.environ.get("STSNET_CKPT", "checkpoints/stsnet_v02_mas.pt")
 HANDEDNESS     = "right"
 MAX_DURATION_S = float(os.environ.get("STSNET_MAX_DURATION", 20))
 DEVICE         = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+VIDEO_ELEM_ID  = "stsnet_video"
 inspector.DEVICE = DEVICE   # _model_activations reads this module-level global
 
 
@@ -86,14 +90,6 @@ MODEL_ENTRY = {
 }
 print(f"  input: {'2D (xy only)' if MODEL_ENTRY['no_z'] else '3D (xyz)'}  "
       f"objective: {_objective}  per-frame: {MODEL_ENTRY['per_frame']}")
-
-LABEL_MAPS = {
-    "shape": MODEL_ENTRY["vocab"]["idx_to_shape"], "att": MODEL_ENTRY["vocab"]["idx_to_att"],
-    "cloc": MODEL_ENTRY["vocab"]["idx_to_cloc"],   "ctype": MODEL_ENTRY["vocab"]["idx_to_ctype"],
-    "motion": MODEL_ENTRY["vocab"]["idx_to_motion"],
-    "hand_type": {0: "one", 1: "two"},
-    "nondom_shape": MODEL_ENTRY["vocab"]["idx_to_shape"], "nondom_att": MODEL_ENTRY["vocab"]["idx_to_att"],
-}
 
 # ---------------------------------------------------------------------------
 # Keypoint overlay drawing (same topology/colors as the inspector's JS)
@@ -163,64 +159,10 @@ def _build_overlay_video(src_video: Path, kp: dict, out_path: Path, progress=Non
 
 
 # ---------------------------------------------------------------------------
-# Clip-level prediction (trained attention pool, not the per-frame probe)
-# ---------------------------------------------------------------------------
-
-def _clip_predictions(streams3d: dict) -> dict[str, list[tuple[str, float]]]:
-    model, no_z = MODEL_ENTRY["model"], MODEL_ENTRY["no_z"]
-    softmax_heads = MODEL_ENTRY["per_frame"] == "softmax"
-    streams = ({k: v[..., :2] for k, v in streams3d.items()} if no_z else streams3d)
-
-    dom    = torch.from_numpy(streams["dominant"]).unsqueeze(0).to(DEVICE)
-    nondom = torch.from_numpy(streams["nondominant"]).unsqueeze(0).to(DEVICE)
-    body   = torch.from_numpy(streams["body"]).unsqueeze(0).to(DEVICE)
-    face   = torch.from_numpy(streams["face"]).unsqueeze(0).to(DEVICE) if "face" in streams else None
-    T = dom.shape[1]
-    full_t = torch.tensor([T], dtype=torch.long, device=DEVICE)
-    zero_t = torch.zeros(1, dtype=torch.long, device=DEVICE)
-
-    with torch.no_grad():
-        out = model(dom, nondom, body, face, sign_start=zero_t, sign_end=full_t, lengths=full_t)
-
-    def _top(head: str, multi_hot: bool) -> list[tuple[str, float]]:
-        logits = out[f"{head}_logits"][0]
-        p = (torch.softmax(logits, -1) if (softmax_heads or not multi_hot) else torch.sigmoid(logits))
-        p = p.cpu().numpy()
-        lm = LABEL_MAPS[head]
-        if multi_hot and not softmax_heads:
-            idxs = [i for i in range(len(p)) if p[i] > 0.5] or [int(p.argmax())]
-        else:
-            idxs = [int(p.argmax())]
-        idxs = sorted(idxs, key=lambda i: -p[i])[:5]
-        return [(lm.get(i, str(i)), float(p[i])) for i in idxs]
-
-    preds = {
-        "shape":  _top("shape",  True),
-        "att":    _top("att",    True),
-        "cloc":   _top("cloc",   True),
-        "ctype":  _top("ctype",  True),
-        "motion": _top("motion", True),
-        "hand_type": _top("hand_type", False),
-    }
-    if model.has_nondom_shape:
-        preds["nondom_shape"] = _top("nondom_shape", True)
-    if model.has_nondom_att:
-        preds["nondom_att"] = _top("nondom_att", True)
-    return preds
-
-
-def _format_summary_md(preds: dict[str, list[tuple[str, float]]]) -> str:
-    lines = ["| Property | Prediction (clip-level) |", "|---|---|"]
-    for head in HEAD_ORDER:
-        if head not in preds:
-            continue
-        vals = ", ".join(f"{label} ({p:.0%})" for label, p in preds[head])
-        lines.append(f"| **{HEAD_TITLES.get(head, head)}** | {vals} |")
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Per-frame streams figure (heatmaps + attention + entropy)
+# Per-frame activation heatmaps — one collapsible pane per head, with a
+# playhead line kept in sync with the shared <video> element client-side
+# (no per-frame data round-trips to the server: it's purely a CSS left%
+# derived from video.currentTime / video.duration).
 # ---------------------------------------------------------------------------
 
 def _pick_rows(probs: np.ndarray, n_show: int, pin_first: int | None) -> list[int]:
@@ -232,52 +174,90 @@ def _pick_rows(probs: np.ndarray, n_show: int, pin_first: int | None) -> list[in
     return rows[:n_show]
 
 
-def _render_streams_figure(model_out: dict) -> plt.Figure:
-    T = model_out["T"] if "T" in model_out else len(model_out["attn"])
-    present = [h for h in HEAD_ORDER if h in model_out["heads"]]
+def _render_head_png(probs: np.ndarray, labels: list[str], rows: list[int]) -> str:
+    fig, ax = plt.subplots(figsize=(10, max(1.0, len(rows) * 0.3)))
+    ax.imshow(probs[:, rows].T, aspect="auto", cmap="YlOrRd", vmin=0, vmax=1,
+               interpolation="nearest")
+    ax.set_yticks(range(len(rows)))
+    ax.set_yticklabels([labels[r] for r in rows], fontsize=8)
+    ax.set_xticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.tick_params(axis="y", length=0)
+    fig.tight_layout(pad=0.3)
 
-    panels = []   # (title, kind, data...)
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=110)
+    plt.close(fig)
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+_STREAMS_CSS = """
+<style>
+  .stsnet-head { border: 1px solid rgba(128,128,128,0.4); border-radius: 8px;
+                 margin-bottom: 8px; overflow: hidden; }
+  .stsnet-head summary { cursor: pointer; padding: 8px 12px; font-weight: 600;
+                          background: rgba(128,128,128,0.12); list-style: revert; }
+  .stsnet-panel { position: relative; line-height: 0; }
+  .stsnet-panel img { width: 100%; display: block; }
+  .stsnet-playhead { position: absolute; top: 0; bottom: 0; left: 0; width: 2px;
+                      background: #e94560; pointer-events: none; }
+</style>
+"""
+
+_STREAMS_SCRIPT = f"""
+<script>
+(function() {{
+  const wrap = document.getElementById("stsnet-streams-wrap");
+  if (!wrap) return;
+  const lines = Array.from(wrap.querySelectorAll('.stsnet-playhead'));
+
+  function findVideo() {{
+    const box = document.getElementById("{VIDEO_ELEM_ID}");
+    return box ? box.querySelector("video") : null;
+  }}
+  function update() {{
+    const video = findVideo();
+    if (!video || !video.duration || isNaN(video.duration)) return;
+    const pct = Math.max(0, Math.min(1, video.currentTime / video.duration)) * 100;
+    lines.forEach(l => {{ l.style.left = pct + "%"; }});
+  }}
+  function attach(tries) {{
+    const video = findVideo();
+    if (!video) {{
+      if (tries > 0) setTimeout(() => attach(tries - 1), 300);
+      return;
+    }}
+    ["timeupdate", "seeking", "seeked", "loadedmetadata", "play"].forEach(ev =>
+      video.addEventListener(ev, update));
+    update();
+  }}
+  attach(20);
+}})();
+</script>
+"""
+
+
+def _render_streams_html(model_out: dict) -> str:
+    present = [h for h in HEAD_ORDER if h in model_out["heads"]]
+    sections = []
     for h in present:
         probs  = np.array(model_out["heads"][h]["probs"])
         labels = model_out["heads"][h]["labels"]
         pin    = 0 if h in ("motion", "cloc", "ctype") else None
         rows   = _pick_rows(probs, N_SHOW.get(h, 10), pin)
-        panels.append((HEAD_TITLES.get(h, h), "heat", probs, labels, rows))
-    panels.append(("Attention", "line", np.array(model_out["attn"]), "steelblue", None))
-    panels.append(("Entropy (bits)", "line", np.array(model_out["entropy"]), "#e9a544", (0, 1)))
-
-    heights = [max(2, len(p[4])) if p[1] == "heat" else 3 for p in panels]
-    fig, axes = plt.subplots(
-        len(panels), 1, figsize=(11, sum(heights) * 0.26 + 1.2), sharex=True,
-        gridspec_kw={"height_ratios": heights},
-    )
-    if len(panels) == 1:
-        axes = [axes]
-
-    for ax, (title, kind, *data) in zip(axes, panels):
-        if kind == "heat":
-            probs, labels, rows = data
-            ax.imshow(probs[:, rows].T, aspect="auto", cmap="YlOrRd", vmin=0, vmax=1,
-                       interpolation="nearest", extent=[0, T, len(rows), 0])
-            ax.set_yticks(np.arange(len(rows)) + 0.5)
-            ax.set_yticklabels([labels[r] for r in rows], fontsize=6.5)
-            ax.set_ylim(len(rows), 0)
-        else:
-            series, color, ylim = data
-            ax.fill_between(range(T), series, color=color, alpha=0.35)
-            ax.plot(series, color=color, linewidth=1)
-            if ylim:
-                ax.set_ylim(*ylim)
-            ax.set_yticks([])
-        ax.set_ylabel(title, fontsize=8.5, rotation=0, ha="right", va="center", labelpad=55)
-        ax.tick_params(axis="y", length=0)
-        for spine in ("top", "right"):
-            ax.spines[spine].set_visible(False)
-
-    axes[-1].set_xlabel("Frame")
-    axes[-1].set_xlim(0, T)
-    fig.tight_layout()
-    return fig
+        img_uri = _render_head_png(probs, labels, rows)
+        open_attr = " open" if h == "shape" else ""
+        sections.append(
+            f'<details{open_attr} class="stsnet-head">'
+            f'<summary>{HEAD_TITLES.get(h, h)}</summary>'
+            f'<div class="stsnet-panel"><img src="{img_uri}" draggable="false">'
+            f'<div class="stsnet-playhead"></div></div>'
+            f'</details>'
+        )
+    body = (f'{_STREAMS_CSS}<div id="stsnet-streams-wrap">{"".join(sections)}</div>'
+            f'{_STREAMS_SCRIPT}')
+    return body
 
 
 # ---------------------------------------------------------------------------
@@ -297,21 +277,21 @@ def _probe_duration(video_path: Path) -> float | None:
 
 
 # ---------------------------------------------------------------------------
-# Gradio callback
+# Gradio callbacks
 # ---------------------------------------------------------------------------
 
 @spaces.GPU(duration=30)
 def _run_model(streams3d: dict):
-    return _model_activations(MODEL_ENTRY, streams3d), _clip_predictions(streams3d)
+    return _model_activations(MODEL_ENTRY, streams3d)
 
 
-def run_demo(video_path, show_overlay, prev_workdir, progress=gr.Progress()):
+def run_demo(uploaded_path, show_overlay, prev_workdir, progress=gr.Progress()):
     if prev_workdir and os.path.isdir(prev_workdir):
         shutil.rmtree(prev_workdir, ignore_errors=True)
 
-    if not video_path:
+    if not uploaded_path:
         raise gr.Error("Please upload a video first.")
-    video_path = Path(video_path)
+    video_path = Path(uploaded_path)
 
     progress(0.0, desc="Checking video...")
     duration = _probe_duration(video_path)
@@ -337,21 +317,20 @@ def run_demo(video_path, show_overlay, prev_workdir, progress=gr.Progress()):
         raise gr.Error("Could not load landmarks from this video — was a signer visible on camera?")
 
     progress(0.6, desc="Running STS-Net...")
-    model_out, preds = _run_model(streams3d)
+    model_out = _run_model(streams3d)
 
-    progress(0.75, desc="Rendering activation plots...")
-    fig = _render_streams_figure(model_out)
+    progress(0.75, desc="Rendering activation heatmaps...")
+    streams_html = _render_streams_html(model_out)
 
-    progress(0.85, desc="Rendering keypoint overlay...")
+    progress(0.8, desc="Rendering keypoint overlay...")
     kp = _load_raw_keypoints(pose_path, video_path)
     overlay_path = workdir / "overlay.mp4"
     _build_overlay_video(video_path, kp, overlay_path,
-                          progress=lambda f: progress(0.85 + 0.14 * f, desc="Rendering keypoint overlay..."))
+                          progress=lambda f: progress(0.8 + 0.19 * f, desc="Rendering keypoint overlay..."))
 
     progress(1.0, desc="Done")
-    summary_md = _format_summary_md(preds)
     display = str(overlay_path) if show_overlay else str(video_path)
-    return display, summary_md, fig, str(video_path), str(overlay_path), str(workdir)
+    return display, streams_html, str(video_path), str(overlay_path), str(workdir)
 
 
 def toggle_overlay(show_overlay, plain_path, overlay_path):
@@ -369,45 +348,44 @@ DESCRIPTION = """
 
 Upload a short clip of someone signing and this model will predict eight
 phonological properties (handshape, orientation, contact location/type,
-motion direction, one-/two-handedness) and show how its per-frame
-confidence evolves across the clip — the same streams as the project's
-local `stsnet-inspect` tool.
+motion direction, one-/two-handedness) frame by frame, and show how its
+confidence evolves across the clip — expand a pane below to see a property's
+per-frame activation heatmap, with a line tracking video playback.
 
-Clips are capped at **{max_s:.0f} seconds** to keep this CPU-only Space
+Clips are capped at **{max_s:.0f} seconds** to keep this free Space
 responsive. Pose is extracted with MediaPipe Holistic; nothing is stored
 after your results are shown. See the
-[GitHub repo](https://github.com/jbeskow/stsnet) for training code, model
-details, and the full desktop inspector.
+[GitHub repo](https://github.com/jbeskow/stsnet) for training code and model
+details.
 """.format(max_s=MAX_DURATION_S)
 
 with gr.Blocks(title="STS-Net Demo") as demo:
     gr.Markdown(DESCRIPTION)
 
-    plain_state   = gr.State()
-    overlay_state = gr.State()
-    workdir_state = gr.State()
+    uploaded_state = gr.State()   # path of the most recently user-uploaded file
+    plain_state    = gr.State()
+    overlay_state  = gr.State()
+    workdir_state  = gr.State()
 
-    with gr.Row():
-        with gr.Column(scale=1):
-            video_in = gr.Video(label="Upload a sign-language clip", sources=["upload"])
-            overlay_toggle = gr.Checkbox(value=True, label="Show MediaPipe keypoint overlay")
-            run_btn = gr.Button("Analyze", variant="primary")
-        with gr.Column(scale=1):
-            video_out = gr.Video(label="Video", interactive=False)
-            summary_out = gr.Markdown()
+    video = gr.Video(elem_id=VIDEO_ELEM_ID, sources=["upload"],
+                      label="Upload a sign-language clip, or drop one here")
+    overlay_toggle = gr.Checkbox(value=True, label="Show MediaPipe keypoint overlay")
+    run_btn = gr.Button("Analyze", variant="primary")
 
-    streams_out = gr.Plot(label="Per-frame streams: activations · attention · entropy")
+    streams_out = gr.HTML()
+
+    video.upload(fn=lambda p: p, inputs=video, outputs=uploaded_state)
 
     run_btn.click(
         fn=run_demo,
-        inputs=[video_in, overlay_toggle, workdir_state],
-        outputs=[video_out, summary_out, streams_out, plain_state, overlay_state, workdir_state],
+        inputs=[uploaded_state, overlay_toggle, workdir_state],
+        outputs=[video, streams_out, plain_state, overlay_state, workdir_state],
         concurrency_limit=1,
     )
     overlay_toggle.change(
         fn=toggle_overlay,
         inputs=[overlay_toggle, plain_state, overlay_state],
-        outputs=[video_out],
+        outputs=[video],
     )
 
 demo.queue(max_size=8)
