@@ -193,15 +193,25 @@ def _render_head_png(probs: np.ndarray, labels: list[str], rows: list[int]) -> s
 
 
 # gr.HTML explicitly does not execute <script> tags embedded in its value
-# (only static markup) — so the playhead can't be wired per-render. Instead
-# the CSS and a single persistent requestAnimationFrame loop live in the
-# page <head> (via gr.Blocks(head=...), see HEAD_EXTRA below) and run once
-# at page load. Each tick re-queries the current video element and the
-# current .stsnet-playhead divs fresh from the DOM rather than caching
-# references, so it stays correct across re-renders (new heatmaps after
-# each Analyze run, a possibly-recreated <video> node) with no reattachment
-# logic needed, and updates continuously during a scrub drag rather than
-# only on discrete events.
+# (only static markup) — so none of this can be wired up per-render. Instead
+# the CSS and all client-side behaviour live in the page <head> (via
+# gr.Blocks(head=...), see HEAD_EXTRA below) and run once at page load:
+#
+#  - A persistent requestAnimationFrame loop drives the per-head playhead
+#    lines AND a custom seek bar (native <input type="range"> — dragging it
+#    is handled entirely by the browser, which tracks horizontal position
+#    even once the pointer leaves the element, unlike Gradio's own video
+#    scrubber). It re-queries the current video element, playhead divs and
+#    seek bar fresh every frame rather than caching references, so it keeps
+#    working across re-renders (new heatmaps after each Analyze run, a
+#    possibly-recreated <video> node) with no reattachment logic needed.
+#  - Left/Right arrow keys step the video by one frame (uses the clip's own
+#    fps, embedded per-render in a hidden #stsnet-fps marker — see
+#    _render_streams_html).
+#  - A window-level dragover/drop preventDefault is a safety net against a
+#    dropped file falling through to the browser's default "open as a new
+#    page" behavior when it lands outside (or Gradio's own drop-zone isn't
+#    live for) the video component.
 HEAD_EXTRA = f"""
 <style>
   .stsnet-head {{ border: 1px solid rgba(128,128,128,0.4); border-radius: 8px;
@@ -212,28 +222,71 @@ HEAD_EXTRA = f"""
   .stsnet-panel img {{ width: 100%; display: block; }}
   .stsnet-playhead {{ position: absolute; top: 0; bottom: 0; left: 0; width: 2px;
                        background: #e94560; pointer-events: none; }}
+  #stsnet-seek {{ width: 100%; margin: 4px 0 10px; accent-color: #e94560; }}
 </style>
 <script>
 (function() {{
+  let scrubbing = false;
+
+  function video() {{ return document.querySelector("#{VIDEO_ELEM_ID} video"); }}
+
+  function ensureSeekBound() {{
+    const seek = document.getElementById("stsnet-seek");
+    if (seek && !seek.dataset.bound) {{
+      seek.dataset.bound = "1";
+      seek.addEventListener("pointerdown", function() {{ scrubbing = true; }});
+      window.addEventListener("pointerup", function() {{ scrubbing = false; }});
+      seek.addEventListener("input", function() {{
+        const v = video();
+        if (v && v.duration) v.currentTime = (seek.value / 1000) * v.duration;
+      }});
+    }}
+    return seek;
+  }}
+
   function tick() {{
-    const video = document.querySelector("#{VIDEO_ELEM_ID} video");
-    if (video && video.duration && !isNaN(video.duration)) {{
-      const pct = Math.max(0, Math.min(1, video.currentTime / video.duration)) * 100;
+    const v = video();
+    const seek = ensureSeekBound();
+    if (v && v.duration && !isNaN(v.duration)) {{
+      const pct = Math.max(0, Math.min(1, v.currentTime / v.duration)) * 100;
       document.querySelectorAll(".stsnet-playhead").forEach(function(l) {{
         l.style.left = pct + "%";
       }});
+      if (seek && !scrubbing) seek.value = pct * 10;
     }}
     requestAnimationFrame(tick);
   }}
   requestAnimationFrame(tick);
+
+  document.addEventListener("keydown", function(e) {{
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    const active = document.activeElement;
+    if (active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA")) return;
+    const v = video();
+    if (!v) return;
+    const fpsEl = document.getElementById("stsnet-fps");
+    const fps = fpsEl ? parseFloat(fpsEl.dataset.fps) : 25;
+    const step = (isFinite(fps) && fps > 0) ? (1 / fps) : 0.04;
+    const dur = v.duration || Infinity;
+    v.currentTime = Math.max(0, Math.min(dur,
+      v.currentTime + (e.key === "ArrowRight" ? step : -step)));
+    e.preventDefault();
+  }});
+
+  ["dragover", "drop"].forEach(function(ev) {{
+    window.addEventListener(ev, function(e) {{ e.preventDefault(); }}, false);
+  }});
 }})();
 </script>
 """
 
 
-def _render_streams_html(model_out: dict) -> str:
+def _render_streams_html(model_out: dict, fps: float) -> str:
     present = [h for h in HEAD_ORDER if h in model_out["heads"]]
-    sections = []
+    sections = [
+        f'<input type="range" id="stsnet-seek" min="0" max="1000" value="0">'
+        f'<div id="stsnet-fps" data-fps="{fps}" style="display:none"></div>'
+    ]
     for h in present:
         probs  = np.array(model_out["heads"][h]["probs"])
         labels = model_out["heads"][h]["labels"]
@@ -309,12 +362,12 @@ def run_demo(uploaded_path, show_overlay, prev_workdir, progress=gr.Progress()):
 
     progress(0.6, desc="Running STS-Net...")
     model_out = _run_model(streams3d)
+    kp = _load_raw_keypoints(pose_path, video_path)
 
     progress(0.75, desc="Rendering activation heatmaps...")
-    streams_html = _render_streams_html(model_out)
+    streams_html = _render_streams_html(model_out, kp["fps"])
 
     progress(0.8, desc="Rendering keypoint overlay...")
-    kp = _load_raw_keypoints(pose_path, video_path)
     overlay_path = workdir / "overlay.mp4"
     _build_overlay_video(video_path, kp, overlay_path,
                           progress=lambda f: progress(0.8 + 0.19 * f, desc="Rendering keypoint overlay..."))
@@ -360,12 +413,19 @@ with gr.Blocks(title="STS-Net Demo", head=HEAD_EXTRA) as demo:
 
     video = gr.Video(elem_id=VIDEO_ELEM_ID, sources=["upload"],
                       label="Upload a sign-language clip, or drop one here")
-    overlay_toggle = gr.Checkbox(value=True, label="Show MediaPipe keypoint overlay")
+    with gr.Row():
+        overlay_toggle = gr.Checkbox(value=True, label="Show MediaPipe keypoint overlay")
+        # Once `video` holds a result, dropping a replacement file onto it is
+        # unreliable (Gradio's own drop-zone for Video doesn't consistently
+        # stay live once the component has a value) — this button is a
+        # guaranteed-to-work alternative for loading a different clip.
+        new_clip_btn = gr.UploadButton("Load a different clip", file_types=["video"], size="sm")
     run_btn = gr.Button("Analyze", variant="primary")
 
     streams_out = gr.HTML()
 
     video.upload(fn=lambda p: p, inputs=video, outputs=uploaded_state)
+    new_clip_btn.upload(fn=lambda p: (p, p), inputs=new_clip_btn, outputs=[video, uploaded_state])
 
     run_btn.click(
         fn=run_demo,
@@ -384,7 +444,8 @@ demo.queue(max_size=8)
 if __name__ == "__main__":
     # ssr_mode defaults to an experimental on-by-default mode on recent
     # Gradio versions; disabled here after observing a first-load layout
-    # oscillation and unreliable drag-and-drop re-uploads that both went
-    # away once the page's JS had fully hydrated (e.g. after a manual
-    # window resize) — symptoms consistent with an SSR/hydration mismatch.
+    # oscillation that went away once the page's JS had fully hydrated
+    # (e.g. after a manual window resize) — symptoms consistent with an
+    # SSR/hydration mismatch. (Did not, on its own, fix drag-and-drop onto
+    # an already-populated Video component — see new_clip_btn above.)
     demo.launch(ssr_mode=False)
