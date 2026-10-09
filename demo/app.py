@@ -411,6 +411,7 @@ with gr.Blocks(title="STS-Net Demo", head=HEAD_EXTRA) as demo:
     overlay_state  = gr.State()
     workdir_state  = gr.State()
 
+    clip_name_out = gr.Markdown()
     video = gr.Video(elem_id=VIDEO_ELEM_ID, sources=["upload"],
                       label="Upload a sign-language clip, or drop one here")
     with gr.Row():
@@ -424,8 +425,13 @@ with gr.Blocks(title="STS-Net Demo", head=HEAD_EXTRA) as demo:
 
     streams_out = gr.HTML()
 
-    video.upload(fn=lambda p: p, inputs=video, outputs=uploaded_state)
-    new_clip_btn.upload(fn=lambda p: (p, p), inputs=new_clip_btn, outputs=[video, uploaded_state])
+    def _on_upload(path):
+        name = f"### {Path(path).name}" if path else ""
+        return path, name
+
+    video.upload(fn=_on_upload, inputs=video, outputs=[uploaded_state, clip_name_out])
+    new_clip_btn.upload(fn=lambda p: (p,) + _on_upload(p),
+                         inputs=new_clip_btn, outputs=[video, uploaded_state, clip_name_out])
 
     run_btn.click(
         fn=run_demo,
