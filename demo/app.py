@@ -442,11 +442,17 @@ with gr.Blocks(title="STS-Net Demo", head=HEAD_EXTRA) as demo:
         new_clip_btn = gr.UploadButton("Load a different clip", file_types=["video"], size="sm")
     run_btn = gr.Button("Analyze", variant="primary")
 
-    streams_out = gr.HTML()
-
     def _on_upload(path):
         name = f"### {Path(path).name}" if path else ""
         return path, name
+
+    gr.Examples(
+        examples=[[str(p)] for p in sorted((Path(__file__).parent / "examples").glob("*.mp4"))],
+        inputs=[video], outputs=[uploaded_state, clip_name_out],
+        fn=_on_upload, run_on_click=True, label="Try an example clip",
+    )
+
+    streams_out = gr.HTML()
 
     video.upload(fn=_on_upload, inputs=video, outputs=[uploaded_state, clip_name_out])
     new_clip_btn.upload(fn=lambda p: (p,) + _on_upload(p),
