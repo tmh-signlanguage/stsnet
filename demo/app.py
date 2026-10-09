@@ -192,47 +192,40 @@ def _render_head_png(probs: np.ndarray, labels: list[str], rows: list[int]) -> s
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-_STREAMS_CSS = """
+# gr.HTML explicitly does not execute <script> tags embedded in its value
+# (only static markup) — so the playhead can't be wired per-render. Instead
+# the CSS and a single persistent requestAnimationFrame loop live in the
+# page <head> (via gr.Blocks(head=...), see HEAD_EXTRA below) and run once
+# at page load. Each tick re-queries the current video element and the
+# current .stsnet-playhead divs fresh from the DOM rather than caching
+# references, so it stays correct across re-renders (new heatmaps after
+# each Analyze run, a possibly-recreated <video> node) with no reattachment
+# logic needed, and updates continuously during a scrub drag rather than
+# only on discrete events.
+HEAD_EXTRA = f"""
 <style>
-  .stsnet-head { border: 1px solid rgba(128,128,128,0.4); border-radius: 8px;
-                 margin-bottom: 8px; overflow: hidden; }
-  .stsnet-head summary { cursor: pointer; padding: 8px 12px; font-weight: 600;
-                          background: rgba(128,128,128,0.12); list-style: revert; }
-  .stsnet-panel { position: relative; line-height: 0; }
-  .stsnet-panel img { width: 100%; display: block; }
-  .stsnet-playhead { position: absolute; top: 0; bottom: 0; left: 0; width: 2px;
-                      background: #e94560; pointer-events: none; }
+  .stsnet-head {{ border: 1px solid rgba(128,128,128,0.4); border-radius: 8px;
+                  margin-bottom: 8px; overflow: hidden; }}
+  .stsnet-head summary {{ cursor: pointer; padding: 8px 12px; font-weight: 600;
+                           background: rgba(128,128,128,0.12); list-style: revert; }}
+  .stsnet-panel {{ position: relative; line-height: 0; }}
+  .stsnet-panel img {{ width: 100%; display: block; }}
+  .stsnet-playhead {{ position: absolute; top: 0; bottom: 0; left: 0; width: 2px;
+                       background: #e94560; pointer-events: none; }}
 </style>
-"""
-
-_STREAMS_SCRIPT = f"""
 <script>
 (function() {{
-  const wrap = document.getElementById("stsnet-streams-wrap");
-  if (!wrap) return;
-  const lines = Array.from(wrap.querySelectorAll('.stsnet-playhead'));
-
-  function findVideo() {{
-    const box = document.getElementById("{VIDEO_ELEM_ID}");
-    return box ? box.querySelector("video") : null;
-  }}
-  function update() {{
-    const video = findVideo();
-    if (!video || !video.duration || isNaN(video.duration)) return;
-    const pct = Math.max(0, Math.min(1, video.currentTime / video.duration)) * 100;
-    lines.forEach(l => {{ l.style.left = pct + "%"; }});
-  }}
-  function attach(tries) {{
-    const video = findVideo();
-    if (!video) {{
-      if (tries > 0) setTimeout(() => attach(tries - 1), 300);
-      return;
+  function tick() {{
+    const video = document.querySelector("#{VIDEO_ELEM_ID} video");
+    if (video && video.duration && !isNaN(video.duration)) {{
+      const pct = Math.max(0, Math.min(1, video.currentTime / video.duration)) * 100;
+      document.querySelectorAll(".stsnet-playhead").forEach(function(l) {{
+        l.style.left = pct + "%";
+      }});
     }}
-    ["timeupdate", "seeking", "seeked", "loadedmetadata", "play"].forEach(ev =>
-      video.addEventListener(ev, update));
-    update();
+    requestAnimationFrame(tick);
   }}
-  attach(20);
+  requestAnimationFrame(tick);
 }})();
 </script>
 """
@@ -255,9 +248,7 @@ def _render_streams_html(model_out: dict) -> str:
             f'<div class="stsnet-playhead"></div></div>'
             f'</details>'
         )
-    body = (f'{_STREAMS_CSS}<div id="stsnet-streams-wrap">{"".join(sections)}</div>'
-            f'{_STREAMS_SCRIPT}')
-    return body
+    return "".join(sections)
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +350,7 @@ after your results are shown. See the
 details.
 """.format(max_s=MAX_DURATION_S)
 
-with gr.Blocks(title="STS-Net Demo") as demo:
+with gr.Blocks(title="STS-Net Demo", head=HEAD_EXTRA) as demo:
     gr.Markdown(DESCRIPTION)
 
     uploaded_state = gr.State()   # path of the most recently user-uploaded file
@@ -391,4 +382,9 @@ with gr.Blocks(title="STS-Net Demo") as demo:
 demo.queue(max_size=8)
 
 if __name__ == "__main__":
-    demo.launch()
+    # ssr_mode defaults to an experimental on-by-default mode on recent
+    # Gradio versions; disabled here after observing a first-load layout
+    # oscillation and unreliable drag-and-drop re-uploads that both went
+    # away once the page's JS had fully hydrated (e.g. after a manual
+    # window resize) — symptoms consistent with an SSR/hydration mismatch.
+    demo.launch(ssr_mode=False)
