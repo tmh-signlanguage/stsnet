@@ -449,7 +449,15 @@ with gr.Blocks(title="STS-Net Demo", head=HEAD_EXTRA) as demo:
     gr.Examples(
         examples=[[str(p)] for p in sorted((Path(__file__).parent / "examples").glob("*.mp4"))],
         inputs=[video], outputs=[uploaded_state, clip_name_out],
-        fn=_on_upload, run_on_click=True, label="Try an example clip",
+        fn=_on_upload, run_on_click=True,
+        # On HF Spaces, cache_examples silently defaults to True whenever fn
+        # + outputs are given, which disables run_on_click (and, here, left
+        # uploaded_state empty — Analyze failed with "Please upload a video
+        # first" even though the video preview loaded). Force it off so
+        # clicking an example actually calls _on_upload live, same as a
+        # real upload.
+        cache_examples=False,
+        label="Try an example clip",
     )
 
     streams_out = gr.HTML()
