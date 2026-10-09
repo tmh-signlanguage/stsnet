@@ -431,8 +431,8 @@ with gr.Blocks(title="STS-Net Demo", head=HEAD_EXTRA) as demo:
     workdir_state  = gr.State()
 
     clip_name_out = gr.Markdown()
-    video = gr.Video(elem_id=VIDEO_ELEM_ID, sources=["upload"],
-                      label="Upload a sign-language clip, or drop one here")
+    video = gr.Video(elem_id=VIDEO_ELEM_ID, sources=["upload", "webcam"],
+                      label="Upload a sign-language clip, record one with your webcam, or drop one here")
     with gr.Row():
         overlay_toggle = gr.Checkbox(value=True, label="Show MediaPipe keypoint overlay")
         # Once `video` holds a result, dropping a replacement file onto it is
@@ -463,6 +463,10 @@ with gr.Blocks(title="STS-Net Demo", head=HEAD_EXTRA) as demo:
     streams_out = gr.HTML()
 
     video.upload(fn=_on_upload, inputs=video, outputs=[uploaded_state, clip_name_out])
+    # Webcam recordings never fire `upload` (that's reserved for the Upload
+    # widget) — only `stop_recording`, once the recorded blob has been
+    # saved server-side, so this is the equivalent hook for that path.
+    video.stop_recording(fn=_on_upload, inputs=video, outputs=[uploaded_state, clip_name_out])
     new_clip_btn.upload(fn=lambda p: (p,) + _on_upload(p),
                          inputs=new_clip_btn, outputs=[video, uploaded_state, clip_name_out])
 
