@@ -4,6 +4,7 @@ ClipClassifier: attention-pooled clip-level sign phonology model (STS-Net v0.2).
 Architecture:
   FrameEncoder × N streams  (or DinoEncoder for flat feature streams)
   → Fusion MLP              (concat → 256-dim)
+  → TemporalTransformer     (optional, tf_layers > 0: global context over the clip)
   → AttentionPool           (masked to sign-frame window)
   → Multi-label heads       (BCE for shape/att/cloc/ctype/motion; CE for hand_type)
 
@@ -21,6 +22,41 @@ import torch.nn as nn
 from torch import Tensor
 
 from stsnet.encoder import FrameEncoder, DinoEncoder
+
+
+class TemporalTransformer(nn.Module):
+    """Pre-LN transformer encoder over fused per-frame features (B, T, D).
+
+    Sinusoidal positions; padding frames (NaN in every pose stream) are masked
+    as keys. Residual output projections are zero-initialised so a freshly
+    inserted block is the identity — warm-started models start unchanged.
+    """
+
+    def __init__(self, d_model: int, layers: int, heads: int = 4,
+                 ff: int | None = None, dropout: float = 0.2, max_len: int = 4096):
+        super().__init__()
+        ff = ff or 4 * d_model
+        layer = nn.TransformerEncoderLayer(d_model, heads, ff, dropout, activation="relu",
+                                           batch_first=True, norm_first=True)
+        self.encoder = nn.TransformerEncoder(layer, layers, enable_nested_tensor=False)
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(max_len).unsqueeze(1).float()
+        div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer("pe", pe, persistent=False)
+        for l in self.encoder.layers:
+            nn.init.zeros_(l.self_attn.out_proj.weight)
+            nn.init.zeros_(l.self_attn.out_proj.bias)
+            nn.init.zeros_(l.linear2.weight)
+            nn.init.zeros_(l.linear2.bias)
+
+    def forward(self, x: Tensor, pad: Tensor | None = None) -> Tensor:
+        if pad is not None:
+            pad = pad & ~pad.all(dim=1, keepdim=True)   # never mask every key of a row
+        pe = self.pe[: x.shape[1]].unsqueeze(0)
+        # Residual over the un-positioned features: out = x + Δ(x + pe)
+        return self.encoder(x + pe, src_key_padding_mask=pad) - pe
 
 
 class AttentionPool(nn.Module):
@@ -74,6 +110,10 @@ class ClipClassifier(nn.Module):
         n_face:           face keypoint count (25 MediaPipe / 68 Sapiens)
         n_dims:           coordinate dims (3 = xyz, 2 = xy only)
         has_nondom_shape: add a non-dominant handshape prediction head
+        has_nondom_att:   add a non-dominant attitude prediction head
+        tf_layers:        temporal transformer layers after fusion (0 = none)
+        tf_heads:         transformer attention heads
+        tf_ff:            transformer feed-forward width (0 = 4 × hidden_dim)
     """
 
     STREAM_JOINTS = {
@@ -100,6 +140,9 @@ class ClipClassifier(nn.Module):
         n_dims:           int = 3,
         has_nondom_shape: bool = False,
         has_nondom_att:   bool = False,
+        tf_layers:        int = 0,
+        tf_heads:         int = 4,
+        tf_ff:            int = 0,
     ):
         super().__init__()
         self.streams = tuple(dict.fromkeys(streams))
@@ -125,6 +168,8 @@ class ClipClassifier(nn.Module):
             nn.ReLU(),
             nn.Dropout(dropout),
         )
+        self.temporal = (TemporalTransformer(D, tf_layers, tf_heads, tf_ff or None, dropout)
+                         if tf_layers > 0 else None)
         self.pool = AttentionPool(D)
 
         self.shape_head      = nn.Linear(D, num_shapes)
@@ -176,7 +221,12 @@ class ClipClassifier(nn.Module):
             **extra_streams,
         }
         feats = [self.encoders[s](stream_inputs[s]) for s in self.streams]
-        return self.fusion(torch.cat(feats, dim=-1))   # (B, T, D)
+        ctx = self.fusion(torch.cat(feats, dim=-1))    # (B, T, D)
+        if self.temporal is not None:
+            pad = torch.stack([torch.isnan(stream_inputs[s][:, :, 0, 0])   # NaN in every stream = padding
+                               for s in self.streams if s in self.STREAM_JOINTS], 0).all(0)
+            ctx = self.temporal(ctx, pad)
+        return ctx
 
     def forward(
         self,
@@ -228,14 +278,13 @@ class ClipClassifier(nn.Module):
         ck = torch.load(ckpt_path, map_location=map_location, weights_only=False)
         kw = dict(ck["vocab_meta"]["model_kwargs"])
         kw["streams"] = tuple(kw["streams"])
-        # Research checkpoints may carry kwargs this release does not implement
-        # (e.g. tf_layers for the temporal-transformer variant); drop zero/False
-        # ones silently, refuse anything that would change the architecture.
+        # Research checkpoints may carry kwargs this release does not implement;
+        # drop zero/False ones silently, refuse anything that would change the architecture.
         import inspect
         known = set(inspect.signature(cls.__init__).parameters)
-        extra = {k: v for k, v in kw.items() if k not in known}
-        if extra.get("tf_layers", 0):
-            raise ValueError(f"checkpoint needs the temporal-transformer variant (not in this release): {extra}")
+        extra = {k: v for k, v in kw.items() if k not in known and v}
+        if extra:
+            raise ValueError(f"checkpoint needs model options not in this release: {extra}")
         kw = {k: v for k, v in kw.items() if k in known}
         model = cls(**kw)
         model.load_state_dict(ck["model_state_dict"])

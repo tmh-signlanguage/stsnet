@@ -3,6 +3,9 @@
 Phonological property prediction for Swedish Sign Language (STS) from pose keypoints.
 
 **Current version: v0.2** — clip-level attention-pooled model (`ClipClassifier`).
+Recommended checkpoint: **`checkpoints/stsnet_v02_mpp.pt`** (2D input, temporal
+transformer, masked-prediction pretraining, location + manner labels — see
+[below](#recommended-stsnet_v02_mpppt)).
 v0.1 and v0.2 are incompatible model families and live in separate trees.
 For the v0.1 per-frame BiLSTM model see [v0.1/README.md](v0.1/README.md).
 
@@ -22,7 +25,7 @@ Eight phonological properties, trained from **per-clip labels** and queryable
 | shape (dom.) | multi-hot BCE | <details><summary>42 handshapes</summary>Flata handen · D-handen · Flata tumhanden · Sprethanden · 4-handen · Vinkelhanden · Tumvinkelhanden · A-handen · S-handen · Klohanden · O-handen · Knutna handen · E-handen · Tumhanden · Pekfingret · L-handen · Raka måtthanden · Nyphanden · Nyphanden (alt) · T-handen · Krokfingret · Måtthanden · Hållhanden · Långfingret · N-handen · Lilla O-handen · Lilla O-handen (alt) · V-handen · Tupphanden · K-handen · Dubbelkroken · Böjda tupphanden · M-handen · W-handen · Lillfingret · U-handen · Flyghanden · Stora långfingret · Runda långfingret · Stora nyphanden · Stora hållhanden · X-handen</details> |
 | att (dom.) | multi-hot BCE | <details><summary>24 orientations</summary>framåtriktad-högervänd · framåtriktad-nedåtvänd · framåtriktad-uppåtvänd · framåtriktad-vänstervänd · högerriktad-framåtvänd · högerriktad-inåtvänd · högerriktad-nedåtvänd · högerriktad-uppåtvänd · inåtriktad-högervänd · inåtriktad-nedåtvänd · inåtriktad-uppåtvänd · inåtriktad-vänstervänd · nedåtriktad-framåtvänd · nedåtriktad-högervänd · nedåtriktad-inåtvänd · nedåtriktad-vänstervänd · uppåtriktad-framåtvänd · uppåtriktad-högervänd · uppåtriktad-inåtvänd · uppåtriktad-vänstervänd · vänsterriktad-framåtvänd · vänsterriktad-inåtvänd · vänsterriktad-nedåtvänd · vänsterriktad-uppåtvänd</details> |
 | contact_loc | multi-hot BCE | <details><summary>22 locations</summary>none · mouth · chin · nose · forehead · cheek · ear · top_of_head · face · head · neck · chest · stomach · hip · shoulder · upper_arm · forearm · elbow · wrist · other_hand · temple · back</details> |
-| contact_type | multi-hot BCE | <details><summary>4 types</summary>none · single · repeated · sustained</details> |
+| contact_type | multi-hot BCE | <details><summary>4 types (9 manner classes in `stsnet_v02_mpp.pt`)</summary>none · single · repeated · sustained — `stsnet_v02_mpp.pt`: none · single · repeated · sustained · front · beside · above · below · near (the last five are non-contact locations relative to the body)</details> |
 | motion | multi-hot BCE | <details><summary>8 directions</summary>none · nedåt · uppåt · framåt · bakåt · åt_höger · åt_vänster · inåt</details> |
 | hand_type | CE | <details><summary>2 classes</summary>one · two</details> |
 | nondom_shape | multi-hot BCE | <details><summary>42 handshapes (optional)</summary>Same vocabulary as shape (dom.)</details> |
@@ -79,7 +82,12 @@ Optional additional streams: WiLoR 3D MANO joints (`wilor_dom`, `wilor_nondom`),
 DINOv2 CLS tokens (`dino`), Moryossef rotation-normalised hands (`dom_norm`, `nondom_norm`),
 or a Sapiens whole-body stream in place of MediaPipe.
 
-Total parameters: ~4.3 M.
+Optionally (`tf_layers > 0`) a **temporal transformer** (pre-LN, 4 heads, sinusoidal
+positions, padding frames masked) sits between fusion and pooling, giving every
+frame global context over the clip; per-frame heads and the pool then read its
+output. `stsnet_v02_mpp.pt` uses 3 layers.
+
+Total parameters: ~4.3 M (6.66 M with 3 transformer layers).
 
 ## Installation
 
@@ -102,7 +110,7 @@ inference you can choose between clip-level and per-frame prediction modes.
 ```python
 from stsnet import ClipClassifierInference
 
-model = ClipClassifierInference("checkpoints/stsnet_v02.pt", device="cuda")
+model = ClipClassifierInference("checkpoints/stsnet_v02_mpp.pt", device="cuda")
 ```
 
 ### Clip-level prediction (one label set per sign)
@@ -164,7 +172,7 @@ video (`.mp4`, `.mov`, `.avi`, `.mkv`, `.webm` — pose is extracted via
 Per-frame predictions, CSV to stdout:
 
 ```bash
-python scripts/predict.py clip.pose --ckpt checkpoints/stsnet_v02.pt
+python scripts/predict.py clip.pose --ckpt checkpoints/stsnet_v02_mpp.pt
 ```
 
 ```
@@ -368,6 +376,49 @@ Same picture for attitude, contact location and motion. Use `stsnet_v02_mas.pt`
 whenever the per-frame output matters; `stsnet_v02_noz.pt` remains ~1–5 pts
 better on clip-level attitude / contact / motion / hand type.
 
+#### Recommended: `stsnet_v02_mpp.pt`
+
+Monotonic-alignment model like `stsnet_v02_mas.pt`, with three changes:
+
+1. **Temporal transformer** (3 layers) after fusion — 6.66 M parameters.
+2. **Masked phonological prediction pretraining** (HuBERT-style). On ~49 h of
+   unlabelled continuous SSLC, a frozen STS-Net teacher labels every frame
+   (softmax of all phase heads); the student sees the same window with 45 % of
+   frames masked in 5–15-frame spans (whole frame, or only the dominant hand) and
+   learns to predict the teacher's distributions at the masked frames from
+   context. It is then fine-tuned with the usual labelled recipe (SSLL + mined
+   SSLC, alignment + pooled objective, 40 epochs).
+3. **Location + manner labels**: corrected contact-location parsing, and the
+   contact-type head becomes a 9-way *manner* head (none / single / repeated /
+   sustained contact, plus non-contact front / beside / above / below / near).
+
+SSLL val (same split as above), clip-level top-1-in-set:
+
+| Property | `stsnet_v02_mas.pt` | `stsnet_v02_mpp.pt` |
+|---|---|---|
+| Handshape (dom.) | 88.0% | **89.3%** |
+| Attitude (dom.) | 78.9% | **81.6%** |
+| Contact location (v3 targets) | 77.7%¹ | **81.4%** |
+| Manner (9 classes, v3 targets) | 67.8%¹ | **74.5%** |
+| Motion direction | 58.9% | **68.6%** |
+| Hand type | 95.0% | **96.7%** |
+| Handshape (nondom.) | 87.5% | **90.1%** |
+| Attitude (nondom.) | 79.4% | **82.4%** |
+
+¹ For contact location and manner the comparison is against the same
+conv-only alignment model retrained on the v3 labels.
+
+Manner recall improves most on the classes the earlier model rarely got right:
+repeated 36 → 61 %, non-contact locations 4–13 → 22–43 %.
+
+Handshape phase sequences: exact match 71.8 % of all clips (vs 46.5 %), 42.0 % of
+multi-phase clips (vs 29.1 %), normalised edit distance 0.173 (vs 0.317),
+phase-count MAE 0.24 (vs 0.95).
+
+The training code for this checkpoint (pretraining, v3 labels) currently lives
+in the research repository; `scripts/train_clip.py` here trains the conv-only
+variant.
+
 ---
 
 ## Repository layout
@@ -379,7 +430,7 @@ data, and `pip install -e .`; see [v0.1/README.md](v0.1/README.md).
 ```
 stsnet/                      v0.2 package
   __init__.py                exports ClipClassifier, ClipClassifierInference
-  clip_classifier.py         ClipClassifier + AttentionPool  ← default model
+  clip_classifier.py         ClipClassifier + AttentionPool + TemporalTransformer  ← default model
   encoder.py                 FrameEncoder, DinoEncoder, TemporalConvBlock
   inference.py               ClipClassifierInference
   data/
@@ -397,6 +448,7 @@ checkpoints/
   stsnet_v02.pt               pretrained v0.2 checkpoint — 3D (xyz) input (Git LFS)
   stsnet_v02_noz.pt           pretrained v0.2 checkpoint — 2D (xy only) input (Git LFS)
   stsnet_v02_mas.pt           v0.2, 2D, monotonic-alignment trained: ordered per-frame phases (Git LFS)
+  stsnet_v02_mpp.pt           v0.2, 2D, + transformer, masked-prediction pretraining, manner labels — recommended (Git LFS)
 data/
   sts_handformer.txt         handshape vocabulary (42 classes)
 v0.1/                        standalone v0.1 tree — own package, scripts, checkpoint, data
