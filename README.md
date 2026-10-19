@@ -387,7 +387,10 @@ Monotonic-alignment model like `stsnet_v02_mas.pt`, with three changes:
    frames masked in 5–15-frame spans (whole frame, or only the dominant hand) and
    learns to predict the teacher's distributions at the masked frames from
    context. It is then fine-tuned with the usual labelled recipe (SSLL + mined
-   SSLC, alignment + pooled objective, 40 epochs).
+   SSLC, alignment + pooled objective, 40 epochs). This is iterated once,
+   HuBERT-style: the fine-tuned model becomes the teacher for a second
+   pretraining run, on SSLC plus ~20 h of Swedish YouTube-SL-25 video (69 h of
+   unlabelled pose in total), followed by the same fine-tune.
 3. **Location + manner labels**: corrected contact-location parsing, and the
    contact-type head becomes a 9-way *manner* head (none / single / repeated /
    sustained contact, plus non-contact front / beside / above / below / near).
@@ -396,24 +399,27 @@ SSLL val (same split as above), clip-level top-1-in-set:
 
 | Property | `stsnet_v02_mas.pt` | `stsnet_v02_mpp.pt` |
 |---|---|---|
-| Handshape (dom.) | 88.0% | **89.3%** |
-| Attitude (dom.) | 78.9% | **81.6%** |
-| Contact location (v3 targets) | 77.7%¹ | **81.4%** |
-| Manner (9 classes, v3 targets) | 67.8%¹ | **74.5%** |
-| Motion direction | 58.9% | **68.6%** |
-| Hand type | 95.0% | **96.7%** |
+| Handshape (dom.) | 88.0% | **89.7%** |
+| Attitude (dom.) | 78.9% | **81.7%** |
+| Contact location (v3 targets) | 77.7%¹ | **82.1%** |
+| Manner (9 classes, v3 targets) | 67.8%¹ | **75.1%** |
+| Motion direction | 58.9% | **69.8%** |
+| Hand type | 95.0% | **96.6%** |
 | Handshape (nondom.) | 87.5% | **90.1%** |
-| Attitude (nondom.) | 79.4% | **82.4%** |
+| Attitude (nondom.) | 79.4% | **82.2%** |
 
 ¹ For contact location and manner the comparison is against the same
 conv-only alignment model retrained on the v3 labels.
 
 Manner recall improves most on the classes the earlier model rarely got right:
-repeated 36 → 61 %, non-contact locations 4–13 → 22–43 %.
+repeated 36 → 63 %, non-contact locations 4–13 → 22–48 %. Over replicate
+fine-tunes the second pretraining iteration adds ≈ +1 pt on location, manner
+and motion (run-to-run spread ≈ 0.5–1 pt) and is neutral on hand shape and
+attitude.
 
-Handshape phase sequences: exact match 71.8 % of all clips (vs 46.5 %), 42.0 % of
-multi-phase clips (vs 29.1 %), normalised edit distance 0.173 (vs 0.317),
-phase-count MAE 0.24 (vs 0.95).
+Handshape phase sequences: exact match 71.4 % of all clips (vs 46.5 %), 42.0 % of
+multi-phase clips (vs 29.1 %), normalised edit distance 0.176 (vs 0.317),
+last phase of multi-phase clips 80.7 % (vs 72.8 %), phase-count MAE 0.26 (vs 0.95).
 
 The training code for this checkpoint (pretraining, v3 labels) currently lives
 in the research repository; `scripts/train_clip.py` here trains the conv-only
