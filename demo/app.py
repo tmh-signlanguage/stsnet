@@ -242,6 +242,7 @@ def _render_head_png(probs: np.ndarray, rows: list[int]) -> str:
 # rows shorter than the label text on narrow (phone) screens, so the label
 # column grew taller than the image and rows drifted out of alignment.
 ROW_PX = 18
+SEEK_THUMB = 14
 
 HEAD_EXTRA = f"""
 <style>
@@ -260,14 +261,34 @@ HEAD_EXTRA = f"""
   .stsnet-imgwrap img {{ width: 100%; height: 100%; display: block;
                           image-rendering: pixelated; }}
   .stsnet-playhead {{ position: absolute; top: 0; bottom: 0; left: 0; width: 2px;
-                       background: #e94560; pointer-events: none; }}
-  .stsnet-seekrow {{ display: flex; align-items: center; gap: 10px; margin: 4px 0 10px; }}
-  #stsnet-seek {{ flex: 1 1 auto; min-width: 0; margin: 0; accent-color: #e94560; }}
-  #stsnet-time {{ flex: none; font-family: ui-monospace, monospace; font-size: 13px;
-                   font-variant-numeric: tabular-nums; white-space: nowrap; }}
-  #{VIDEO_ELEM_ID} {{ width: 50% !important; max-width: 50%; align-self: center;
-                       margin: 0 auto; flex: none; }}
-  @media (max-width: 600px) {{ #{VIDEO_ELEM_ID} {{ width: 100% !important; max-width: 100%; }} }}
+                       transform: translateX(-1px); background: #e94560; pointer-events: none; }}
+  /* The seek row mirrors a heatmap pane: a label-width time column, then a
+     slider spanning exactly the heatmap image. The 1px side margins match
+     the panes' borders. The slider's thumb is styled to a fixed width and
+     the input overhangs by half of it on each side, so the thumb's centre
+     sits on the image's first column at 0 and its last column at the end
+     (a native range input stops the thumb's centre half a thumb short of
+     each end, at a browser-dependent width). */
+  .stsnet-seekrow {{ display: flex; align-items: center; margin: 4px 1px 10px; }}
+  .stsnet-timecol {{ flex: 0 0 150px; box-sizing: border-box; padding-right: 6px;
+                      text-align: right; font-family: ui-monospace, monospace;
+                      font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; }}
+  #stsnet-time {{ display: block; font-size: 12px; }}
+  #stsnet-frame {{ display: block; font-size: 11px; opacity: 0.7; }}
+  .stsnet-seekwrap {{ flex: 1 1 auto; min-width: 0; display: flex; }}
+  #stsnet-seek {{ -webkit-appearance: none; appearance: none; background: transparent;
+                   height: {SEEK_THUMB}px; margin: 0 -{SEEK_THUMB // 2}px;
+                   width: calc(100% + {SEEK_THUMB}px); padding: 0; cursor: pointer; }}
+  #stsnet-seek::-webkit-slider-runnable-track {{ height: 4px; border-radius: 2px;
+                                                  background: rgba(128,128,128,0.4); }}
+  #stsnet-seek::-webkit-slider-thumb {{ -webkit-appearance: none; width: {SEEK_THUMB}px;
+                                         height: {SEEK_THUMB}px; border-radius: 50%; border: none;
+                                         margin-top: -{(SEEK_THUMB - 4) // 2}px; background: #e94560; }}
+  #stsnet-seek::-moz-range-track {{ height: 4px; border-radius: 2px; background: rgba(128,128,128,0.4); }}
+  #stsnet-seek::-moz-range-thumb {{ width: {SEEK_THUMB}px; height: {SEEK_THUMB}px; border-radius: 50%;
+                                     border: none; background: #e94560; }}
+  @media (max-width: 600px) {{ .stsnet-timecol {{ flex-basis: 96px; }}
+                               #stsnet-time {{ font-size: 10px; }} }}
   .stsnet-model {{ font-size: 13px; opacity: 0.75; margin-bottom: 6px; }}
 </style>
 <script>
@@ -301,11 +322,15 @@ HEAD_EXTRA = f"""
       if (seek && !scrubbing) seek.value = pct * 10;
       const timeEl = document.getElementById("stsnet-time");
       if (timeEl) {{
-        const fpsEl = document.getElementById("stsnet-fps");
-        const fps = fpsEl ? parseFloat(fpsEl.dataset.fps) : NaN;
-        let txt = v.currentTime.toFixed(2) + " / " + v.duration.toFixed(2) + " s";
-        if (isFinite(fps) && fps > 0) txt += "  ·  frame " + Math.floor(v.currentTime * fps + 1e-3);
+        const txt = v.currentTime.toFixed(2) + " / " + v.duration.toFixed(2) + " s";
         if (timeEl.textContent !== txt) timeEl.textContent = txt;
+      }}
+      const frameEl = document.getElementById("stsnet-frame");
+      const fpsEl = document.getElementById("stsnet-fps");
+      const fps = fpsEl ? parseFloat(fpsEl.dataset.fps) : NaN;
+      if (frameEl && isFinite(fps) && fps > 0) {{
+        const ftxt = "frame " + Math.floor(v.currentTime * fps + 1e-3);
+        if (frameEl.textContent !== ftxt) frameEl.textContent = ftxt;
       }}
     }}
     requestAnimationFrame(tick);
@@ -340,8 +365,10 @@ def _render_streams_html(model_out: dict, fps: float) -> str:
     sections = [
         f'<div class="stsnet-model">Model: <code>{html.escape(model_out["name"])}</code></div>'
         f'<div class="stsnet-seekrow">'
-        f'<input type="range" id="stsnet-seek" min="0" max="1000" value="0">'
-        f'<span id="stsnet-time">0.00 s</span></div>'
+        f'<div class="stsnet-timecol"><span id="stsnet-time">0.00 s</span>'
+        f'<span id="stsnet-frame">frame 0</span></div>'
+        f'<div class="stsnet-seekwrap">'
+        f'<input type="range" id="stsnet-seek" min="0" max="1000" value="0"></div></div>'
         f'<div id="stsnet-fps" data-fps="{fps}" style="display:none"></div>'
     ]
     for h in present:
@@ -503,25 +530,6 @@ with gr.Blocks(title="STS-Net Demo", head=HEAD_EXTRA) as demo:
     overlay_state  = gr.State()
     workdir_state  = gr.State()
 
-    clip_name_out = gr.Markdown()
-    video = gr.Video(elem_id=VIDEO_ELEM_ID, sources=["upload", "webcam"],
-                      label="Upload a sign-language clip, record one with your webcam, or drop one here")
-    with gr.Row():
-        overlay_toggle = gr.Checkbox(value=True, label="Show MediaPipe keypoint overlay")
-        left_toggle = gr.Checkbox(value=False, label="Mirror (dominant hand is left)")
-        # Once `video` holds a result, dropping a replacement file onto it is
-        # unreliable (Gradio's own drop-zone for Video doesn't consistently
-        # stay live once the component has a value) — this button is a
-        # guaranteed-to-work alternative for loading a different clip.
-        new_clip_btn = gr.UploadButton("Load a different clip", file_types=["video"], size="sm")
-    with gr.Accordion("Advanced", open=False):
-        model_dd = gr.Dropdown(
-            choices=[(_model_choice_label(n), n) for n in MODELS],
-            value=DEFAULT_MODEL, label="Checkpoint",
-            info="Takes effect on the next Analyze.",
-        )
-    run_btn = gr.Button("Analyze", variant="primary")
-
     def _on_upload(path):
         name = f"### {Path(path).name}" if path else ""
         return path, name
@@ -533,20 +541,43 @@ with gr.Blocks(title="STS-Net Demo", head=HEAD_EXTRA) as demo:
         "soffa-00669-tecken.mp4": "soffa (couch)",
     }
     _example_paths = [Path(__file__).parent / "examples" / n for n in _example_labels]
-    gr.Examples(
-        examples=[[str(p)] for p in _example_paths],
-        example_labels=[_example_labels[p.name] for p in _example_paths],
-        inputs=[video], outputs=[uploaded_state, clip_name_out],
-        fn=_on_upload, run_on_click=True,
-        # On HF Spaces, cache_examples silently defaults to True whenever fn
-        # + outputs are given, which disables run_on_click (and, here, left
-        # uploaded_state empty — Analyze failed with "Please upload a video
-        # first" even though the video preview loaded). Force it off so
-        # clicking an example actually calls _on_upload live, same as a
-        # real upload.
-        cache_examples=False,
-        label="Try an example clip",
-    )
+
+    clip_name_out = gr.Markdown()
+    # Two columns side by side; Gradio wraps them into one stacked column
+    # once the page is narrower than the two min_widths combined (phones).
+    with gr.Row(equal_height=False):
+        with gr.Column(scale=1, min_width=320):
+            video = gr.Video(elem_id=VIDEO_ELEM_ID, sources=["upload", "webcam"],
+                              label="Upload a sign-language clip, record one with your webcam, or drop one here")
+        with gr.Column(scale=1, min_width=280):
+            overlay_toggle = gr.Checkbox(value=True, label="Show MediaPipe keypoint overlay")
+            left_toggle = gr.Checkbox(value=False, label="Mirror (dominant hand is left)")
+            # Once `video` holds a result, dropping a replacement file onto it is
+            # unreliable (Gradio's own drop-zone for Video doesn't consistently
+            # stay live once the component has a value) — this button is a
+            # guaranteed-to-work alternative for loading a different clip.
+            new_clip_btn = gr.UploadButton("Load a different clip", file_types=["video"], size="sm")
+            with gr.Accordion("Advanced", open=False):
+                model_dd = gr.Dropdown(
+                    choices=[(_model_choice_label(n), n) for n in MODELS],
+                    value=DEFAULT_MODEL, label="Checkpoint",
+                    info="Takes effect on the next Analyze.",
+                )
+            run_btn = gr.Button("Analyze", variant="primary")
+            gr.Examples(
+                examples=[[str(p)] for p in _example_paths],
+                example_labels=[_example_labels[p.name] for p in _example_paths],
+                inputs=[video], outputs=[uploaded_state, clip_name_out],
+                fn=_on_upload, run_on_click=True,
+                # On HF Spaces, cache_examples silently defaults to True whenever
+                # fn + outputs are given, which disables run_on_click (and, here,
+                # left uploaded_state empty — Analyze failed with "Please upload
+                # a video first" even though the video preview loaded). Force it
+                # off so clicking an example actually calls _on_upload live,
+                # same as a real upload.
+                cache_examples=False,
+                label="Try an example clip",
+            )
 
     streams_out = gr.HTML()
 
