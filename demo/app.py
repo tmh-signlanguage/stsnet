@@ -67,29 +67,47 @@ def _invert(d: dict) -> dict:
     return {v: k for k, v in d.items()}
 
 
-print(f"Loading ClipClassifier from {CKPT_PATH}...")
-_model, _vocab_meta = ClipClassifier.from_checkpoint(CKPT_PATH, map_location=str(DEVICE))
-_model.to(DEVICE)
-_model.eval()
+def _load_entry(ckpt: Path) -> dict:
+    print(f"Loading ClipClassifier from {ckpt}...")
+    model, meta = ClipClassifier.from_checkpoint(str(ckpt), map_location=str(DEVICE))
+    model.to(DEVICE)
+    model.eval()
+    n_dims    = meta.get("model_kwargs", {}).get("n_dims", 3)
+    objective = meta.get("objective", "ap")
+    # Objectives compose with "+" (e.g. "mpp_pretrain+mas_hard+pool"); any
+    # MAS component means the per-frame heads were trained as softmax.
+    mas = any(part.startswith("mas") for part in objective.split("+"))
+    entry = {
+        "name": ckpt.stem,
+        "model": model,
+        "no_z": n_dims == 2,
+        "per_frame": "softmax" if mas else "sigmoid",
+        "objective": objective,
+        "vocab": {
+            "idx_to_shape":  _invert(meta.get("shape_to_idx",  {})),
+            "idx_to_att":    _invert(meta.get("att_to_idx",    {})),
+            "idx_to_motion": _invert(meta.get("motion_to_idx", {})),
+            "idx_to_cloc":   _invert(meta.get("cloc_to_idx",   {})),
+            "idx_to_ctype":  _invert(meta.get("ctype_to_idx",  {})),
+        },
+    }
+    print(f"  input: {'2D (xy only)' if entry['no_z'] else '3D (xyz)'}  "
+          f"objective: {objective}  per-frame: {entry['per_frame']}")
+    return entry
 
-_ckpt_n_dims = _vocab_meta.get("model_kwargs", {}).get("n_dims", 3)
-_objective   = _vocab_meta.get("objective", "ap")
 
-MODEL_ENTRY = {
-    "name": Path(CKPT_PATH).stem,
-    "model": _model,
-    "no_z": _ckpt_n_dims == 2,
-    "per_frame": "softmax" if _objective.startswith("mas") else "sigmoid",
-    "vocab": {
-        "idx_to_shape":  _invert(_vocab_meta.get("shape_to_idx",  {})),
-        "idx_to_att":    _invert(_vocab_meta.get("att_to_idx",    {})),
-        "idx_to_motion": _invert(_vocab_meta.get("motion_to_idx", {})),
-        "idx_to_cloc":   _invert(_vocab_meta.get("cloc_to_idx",   {})),
-        "idx_to_ctype":  _invert(_vocab_meta.get("ctype_to_idx",  {})),
-    },
-}
-print(f"  input: {'2D (xy only)' if MODEL_ENTRY['no_z'] else '3D (xyz)'}  "
-      f"objective: {_objective}  per-frame: {MODEL_ENTRY['per_frame']}")
+# Every checkpoint is loaded up front, not on demand: on ZeroGPU, moving a
+# model to CUDA is only safe at import time (tensors get packed for the GPU
+# worker then), and these are small (~17-27 MB each).
+_default_ckpt = Path(CKPT_PATH)
+_ckpts = sorted(_default_ckpt.parent.glob("*.pt"), key=lambda p: (p != _default_ckpt, p.name))
+MODELS = {p.stem: _load_entry(p) for p in _ckpts}
+DEFAULT_MODEL = _default_ckpt.stem
+
+
+def _model_choice_label(name: str) -> str:
+    e = MODELS[name]
+    return f"{name}  ({e['objective']}, {'2D' if e['no_z'] else '3D'})"
 
 # ---------------------------------------------------------------------------
 # Keypoint overlay drawing (same topology/colors as the inspector's JS)
@@ -243,7 +261,14 @@ HEAD_EXTRA = f"""
                           image-rendering: pixelated; }}
   .stsnet-playhead {{ position: absolute; top: 0; bottom: 0; left: 0; width: 2px;
                        background: #e94560; pointer-events: none; }}
-  #stsnet-seek {{ width: 100%; margin: 4px 0 10px; accent-color: #e94560; }}
+  .stsnet-seekrow {{ display: flex; align-items: center; gap: 10px; margin: 4px 0 10px; }}
+  #stsnet-seek {{ flex: 1 1 auto; min-width: 0; margin: 0; accent-color: #e94560; }}
+  #stsnet-time {{ flex: none; font-family: ui-monospace, monospace; font-size: 13px;
+                   font-variant-numeric: tabular-nums; white-space: nowrap; }}
+  #{VIDEO_ELEM_ID} {{ width: 50% !important; max-width: 50%; align-self: center;
+                       margin: 0 auto; flex: none; }}
+  @media (max-width: 600px) {{ #{VIDEO_ELEM_ID} {{ width: 100% !important; max-width: 100%; }} }}
+  .stsnet-model {{ font-size: 13px; opacity: 0.75; margin-bottom: 6px; }}
 </style>
 <script>
 (function() {{
@@ -274,6 +299,14 @@ HEAD_EXTRA = f"""
         l.style.left = pct + "%";
       }});
       if (seek && !scrubbing) seek.value = pct * 10;
+      const timeEl = document.getElementById("stsnet-time");
+      if (timeEl) {{
+        const fpsEl = document.getElementById("stsnet-fps");
+        const fps = fpsEl ? parseFloat(fpsEl.dataset.fps) : NaN;
+        let txt = v.currentTime.toFixed(2) + " / " + v.duration.toFixed(2) + " s";
+        if (isFinite(fps) && fps > 0) txt += "  ·  frame " + Math.floor(v.currentTime * fps + 1e-3);
+        if (timeEl.textContent !== txt) timeEl.textContent = txt;
+      }}
     }}
     requestAnimationFrame(tick);
   }}
@@ -305,7 +338,10 @@ HEAD_EXTRA = f"""
 def _render_streams_html(model_out: dict, fps: float) -> str:
     present = [h for h in HEAD_ORDER if h in model_out["heads"]]
     sections = [
+        f'<div class="stsnet-model">Model: <code>{html.escape(model_out["name"])}</code></div>'
+        f'<div class="stsnet-seekrow">'
         f'<input type="range" id="stsnet-seek" min="0" max="1000" value="0">'
+        f'<span id="stsnet-time">0.00 s</span></div>'
         f'<div id="stsnet-fps" data-fps="{fps}" style="display:none"></div>'
     ]
     for h in present:
@@ -377,11 +413,12 @@ def _normalize_recording(src: Path) -> Path | None:
 # ---------------------------------------------------------------------------
 
 @spaces.GPU(duration=30)
-def _run_model(streams3d: dict):
-    return _model_activations(MODEL_ENTRY, streams3d)
+def _run_model(model_name: str, streams3d: dict):
+    return _model_activations(MODELS[model_name], streams3d)
 
 
-def run_demo(uploaded_path, show_overlay, left_dominant, prev_workdir, progress=gr.Progress()):
+def run_demo(uploaded_path, show_overlay, left_dominant, model_name, prev_workdir,
+             progress=gr.Progress()):
     if prev_workdir and os.path.isdir(prev_workdir):
         shutil.rmtree(prev_workdir, ignore_errors=True)
 
@@ -414,7 +451,9 @@ def run_demo(uploaded_path, show_overlay, left_dominant, prev_workdir, progress=
         raise gr.Error("Could not load landmarks from this video — was a signer visible on camera?")
 
     progress(0.6, desc="Running STS-Net...")
-    model_out = _run_model(streams3d)
+    if model_name not in MODELS:
+        model_name = DEFAULT_MODEL
+    model_out = _run_model(model_name, streams3d)
     kp = _load_raw_keypoints(pose_path, video_path)
 
     progress(0.75, desc="Rendering activation heatmaps...")
@@ -475,6 +514,12 @@ with gr.Blocks(title="STS-Net Demo", head=HEAD_EXTRA) as demo:
         # stay live once the component has a value) — this button is a
         # guaranteed-to-work alternative for loading a different clip.
         new_clip_btn = gr.UploadButton("Load a different clip", file_types=["video"], size="sm")
+    with gr.Accordion("Advanced", open=False):
+        model_dd = gr.Dropdown(
+            choices=[(_model_choice_label(n), n) for n in MODELS],
+            value=DEFAULT_MODEL, label="Checkpoint",
+            info="Takes effect on the next Analyze.",
+        )
     run_btn = gr.Button("Analyze", variant="primary")
 
     def _on_upload(path):
@@ -516,7 +561,7 @@ with gr.Blocks(title="STS-Net Demo", head=HEAD_EXTRA) as demo:
 
     run_btn.click(
         fn=run_demo,
-        inputs=[uploaded_state, overlay_toggle, left_toggle, workdir_state],
+        inputs=[uploaded_state, overlay_toggle, left_toggle, model_dd, workdir_state],
         outputs=[video, streams_out, plain_state, overlay_state, workdir_state],
         concurrency_limit=1,
     )
