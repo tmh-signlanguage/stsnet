@@ -399,17 +399,31 @@ SSLL val (same split as above), clip-level top-1-in-set:
 
 | Property | `stsnet_v02_mas.pt` | `stsnet_v02_mpp.pt` |
 |---|---|---|
-| Handshape (dom.) | 88.0% | **89.7%** |
-| Attitude (dom.) | 78.9% | **81.7%** |
-| Contact location (v3 targets) | 77.7%¹ | **82.1%** |
-| Manner (9 classes, v3 targets) | 67.8%¹ | **75.1%** |
-| Motion direction | 58.9% | **69.8%** |
-| Hand type | 95.0% | **96.6%** |
-| Handshape (nondom.) | 87.5% | **90.1%** |
-| Attitude (nondom.) | 79.4% | **82.2%** |
+| Handshape (dom.) | 88.0% | **89.6%** |
+| Attitude (dom.) | 78.9% | **81.3%** |
+| Contact location (v4 targets) | 77.7%¹ | **82.4%** |
+| Manner (9 classes, v4 targets) | 67.8%¹ | **75.2%** |
+| Motion direction (v4 targets) | 58.9% | **69.6%** |
+| Hand type | 95.0% | **96.0%** |
+| Handshape (nondom.) | 87.5% | **88.7%** |
+| Attitude (nondom.) | 79.4% | **81.2%** |
 
 ¹ For contact location and manner the comparison is against the same
-conv-only alignment model retrained on the v3 labels.
+conv-only alignment model retrained on the v3 labels (scored on v3 targets).
+
+**v4 labels (current checkpoint, 2026-10-29).** The checkpoint is fine-tuned on
+label version v4: a grammar-based coverage check of the SSLL descriptions found
+parts the v3 parser dropped, now parsed — shape changes with adverbials
+("förändras först/sedan till X", chained changes), bare motion directions
+("förs upp/fram/in"), "kontakt med <handform>" as the non-dominant hand, more
+contact keywords and body locations, a second contact location ("… och sedan
+på X"), per-hand attitudes ("den högra … den vänstra …") and "riktade/vända från
+varandra". Targets change in ~5.7k SSLL clips; class inventories are unchanged,
+so the interface is identical to the previous `stsnet_v02_mpp.pt`. Against the
+previous checkpoint on v4 targets: contact location +2.9, manner +2.9, motion
++2.4, nondom. attitude +1.6, nondom. handshape +0.9 pts; handshape and attitude
+unchanged. On clips with multi-step shape changes it gets the last shape right
+59 % of the time (previous checkpoint 41 %).
 
 Manner recall improves most on the classes the earlier model rarely got right:
 repeated 36 → 63 %, non-contact locations 4–13 → 22–48 %. Over replicate
@@ -417,11 +431,16 @@ fine-tunes the second pretraining iteration adds ≈ +1 pt on location, manner
 and motion (run-to-run spread ≈ 0.5–1 pt) and is neutral on hand shape and
 attitude.
 
-Handshape phase sequences: exact match 71.4 % of all clips (vs 46.5 %), 42.0 % of
+Handshape phase sequences: exact match 71.1 % of all clips (vs 46.5 %), 40.8 % of
 multi-phase clips (vs 29.1 %), normalised edit distance 0.176 (vs 0.317),
-last phase of multi-phase clips 80.7 % (vs 72.8 %), phase-count MAE 0.26 (vs 0.95).
+last phase of multi-phase clips 80.5 % (vs 72.8 %), phase-count MAE 0.27 (vs 0.95).
 
-The training code for this checkpoint (pretraining, v3 labels) currently lives
+Known limitation: on continuous signing the transformer models change handshape
+less often than the conv-only model (≈0.8 vs 1.9 changes/s on SSLC, catching
+about half as many pose-measured hand changes at similar precision). For dense
+per-frame handshape in running signing, `stsnet_v02_mas.pt` may be preferable.
+
+The training code for this checkpoint (pretraining, v3/v4 labels) currently lives
 in the research repository; `scripts/train_clip.py` here trains the conv-only
 variant.
 

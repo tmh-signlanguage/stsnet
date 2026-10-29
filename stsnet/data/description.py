@@ -237,7 +237,14 @@ def parse_motion_dir(phase: str) -> str | None:
 # Description parser
 # ---------------------------------------------------------------------------
 
-_FORANDRAS_RE = re.compile(r'förändras\s+till\s+([^,]+)', re.IGNORECASE)
+# "förändras till X", also with an adverbial before "till" ("förändras först / sedan /
+# slutligen / ett par gånger / framför munnen till X") and the "til" typo.
+_FORANDRAS_RE = re.compile(r'förändras\s+(?:(?!till?\b)[^,/\s]+\s+){0,4}?till?\s+([^,]+)', re.IGNORECASE)
+# Words that end a shape name after "till" (contact / motion / manner follows).
+_SHAPE_END_RE = re.compile(r'\s+(?:med|i|mot|och|framför|upprepas|som|samtidigt|ovanför|under|ovanpå|'
+                           r'till|flera|ett|sedan|därefter|slutligen|bredvid|vid|bakom|nedanför)\b', re.IGNORECASE)
+# Chained changes after the first: "… till X och sedan / därefter / slutligen till Y".
+_FORANDRAS_NEXT_RE = re.compile(r'\b(?:och\s+)?(?:sedan|därefter|slutligen)\s+till\s+([^,]+)', re.IGNORECASE)
 
 # Optional module-level LLM-fallback cache: maps description string →
 # list of (shape, att, plural, cloc, ctype) tuples (same format as the
@@ -334,14 +341,17 @@ def _parse_description(desc: str) -> list[tuple]:
         result.append((canonical, att, hand_type, contact_loc, contact_type, motion, nondom_shape, nondom_att))
 
         # "förändras till X" anywhere in a phase → extra end-shape entry
+        # ("förändras först till X och sedan till Y" → one entry per shape)
         m = _FORANDRAS_RE.search(phase_norm)
         if m:
-            end_raw = m.group(1).strip()
-            for _sep in (' med ', ' i ', ' mot ', ' och ', ' framför ', ' upprepas'):
-                end_raw = end_raw.split(_sep)[0]
-            end_canonical = _normalise_shape(end_raw.strip())
-            if end_canonical and end_canonical != canonical:
-                result.append((end_canonical, None, hand_type, contact_loc, contact_type, None, nondom_shape, nondom_att))
+            raws = [m.group(1)] + [n.group(1) for n in _FORANDRAS_NEXT_RE.finditer(phase_norm, m.start(1), m.end(1))]
+            prev = canonical
+            for end_raw in raws:
+                end_raw = _SHAPE_END_RE.split(end_raw.strip())[0]
+                end_canonical = _normalise_shape(end_raw.strip())
+                if end_canonical and end_canonical != prev:
+                    result.append((end_canonical, None, hand_type, contact_loc, contact_type, None, nondom_shape, nondom_att))
+                    prev = end_canonical
 
     if result:
         return result
