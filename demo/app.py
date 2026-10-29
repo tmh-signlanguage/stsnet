@@ -526,8 +526,16 @@ with gr.Blocks(title="STS-Net Demo", head=HEAD_EXTRA) as demo:
         name = f"### {Path(path).name}" if path else ""
         return path, name
 
+    # Clips by signers held out from training (signer_2, signer_15).
+    _example_labels = {
+        "hok-03599-tecken.mp4":   "hök (hawk)",
+        "apa-05890-tecken.mp4":   "apa (monkey)",
+        "soffa-00669-tecken.mp4": "soffa (couch)",
+    }
+    _example_paths = [Path(__file__).parent / "examples" / n for n in _example_labels]
     gr.Examples(
-        examples=[[str(p)] for p in sorted((Path(__file__).parent / "examples").glob("*.mp4"))],
+        examples=[[str(p)] for p in _example_paths],
+        example_labels=[_example_labels[p.name] for p in _example_paths],
         inputs=[video], outputs=[uploaded_state, clip_name_out],
         fn=_on_upload, run_on_click=True,
         # On HF Spaces, cache_examples silently defaults to True whenever fn
