@@ -3,17 +3,14 @@
 Phonological property prediction for Swedish Sign Language (STS) from pose keypoints.
 
 **Current version: v0.2** — clip-level attention-pooled model (`ClipClassifier`).
-Recommended checkpoint: **`checkpoints/stsnet_v02_mas.pt`** (2D input, convolutional,
-monotonic-alignment trained per-frame phases — see
-[below](#per-frame-phase-sequences-stsnet_v02_maspt)).
+Recommended checkpoint: **`checkpoints/stsnet_v02_mpp.pt`** (2D input, convolution +
+3-layer transformer, masked-prediction pretraining, monotonic-alignment trained per-frame
+phases — see [below](#transformer--masked-prediction-pretraining-stsnet_v02_mpppt)).
+It is the most accurate checkpoint on both isolated dictionary signs (SSLL) and
+continuous signing (SSLC). `checkpoints/stsnet_v02_mas.pt` is the smaller
+convolution-only alternative (no transformer); it changes handshape more readily
+from frame to frame, including more spurious changes.
 
-> **Note on `stsnet_v02_mpp.pt` (transformer).** It scores higher on isolated
-> dictionary signs (SSLL), but on continuous signing (SSLC) it under-segments:
-> it changes handshape about half as often as `stsnet_v02_mas.pt` and its
-> per-frame changes track the hand-pose changes less closely. Restricting its
-> attention or training on short crops did not fix this. Use it for isolated
-> signs; for running signing and per-frame output use `stsnet_v02_mas.pt`. See
-> [below](#transformer--masked-prediction-pretraining-stsnet_v02_mpppt-isolated-signs).
 v0.1 and v0.2 are incompatible model families and live in separate trees.
 For the v0.1 per-frame BiLSTM model see [v0.1/README.md](v0.1/README.md).
 
@@ -118,7 +115,7 @@ inference you can choose between clip-level and per-frame prediction modes.
 ```python
 from stsnet import ClipClassifierInference
 
-model = ClipClassifierInference("checkpoints/stsnet_v02_mas.pt", device="cuda")
+model = ClipClassifierInference("checkpoints/stsnet_v02_mpp.pt", device="cuda")
 ```
 
 ### Clip-level prediction (one label set per sign)
@@ -180,7 +177,7 @@ video (`.mp4`, `.mov`, `.avi`, `.mkv`, `.webm` — pose is extracted via
 Per-frame predictions, CSV to stdout:
 
 ```bash
-python scripts/predict.py clip.pose --ckpt checkpoints/stsnet_v02_mas.pt
+python scripts/predict.py clip.pose --ckpt checkpoints/stsnet_v02_mpp.pt
 ```
 
 ```
@@ -380,11 +377,11 @@ n = 4043 clips, 1320 of them multi-phase):
 | last phase correct, multi-phase clips | 4.8% | **72.8%** |
 | phase-count error (MAE, phases) | 2.43 | **0.95** |
 
-Same picture for attitude, contact location and motion. `stsnet_v02_mas.pt` is the
-recommended checkpoint, and the one to use whenever the per-frame output matters; `stsnet_v02_noz.pt` remains ~1–5 pts
+Same picture for attitude, contact location and motion. Among the conv-only
+checkpoints, `stsnet_v02_mas.pt` is the one to use whenever the per-frame output matters; `stsnet_v02_noz.pt` remains ~1–5 pts
 better on clip-level attitude / contact / motion / hand type.
 
-#### Transformer + masked-prediction pretraining: `stsnet_v02_mpp.pt` (isolated signs)
+#### Transformer + masked-prediction pretraining: `stsnet_v02_mpp.pt`
 
 Monotonic-alignment model like `stsnet_v02_mas.pt`, with three changes:
 
@@ -407,19 +404,19 @@ SSLL val (same split as above), clip-level top-1-in-set:
 
 | Property | `stsnet_v02_mas.pt` | `stsnet_v02_mpp.pt` |
 |---|---|---|
-| Handshape (dom.) | 88.0% | **89.6%** |
-| Attitude (dom.) | 78.9% | **81.3%** |
-| Contact location (v4 targets) | 77.7%¹ | **82.4%** |
-| Manner (9 classes, v4 targets) | 67.8%¹ | **75.2%** |
-| Motion direction (v4 targets) | 58.9% | **69.6%** |
-| Hand type | 95.0% | **96.0%** |
-| Handshape (nondom.) | 87.5% | **88.7%** |
-| Attitude (nondom.) | 79.4% | **81.2%** |
+| Handshape (dom.) | 88.0% | **89.4%** |
+| Attitude (dom.) | 78.9% | **81.7%** |
+| Contact location (v4 targets) | 77.7%¹ | **83.6%** |
+| Manner (9 classes, v4 targets) | 67.8%¹ | **75.5%** |
+| Motion direction (v4 targets) | 58.9% | **70.4%** |
+| Hand type | 95.0% | **96.6%** |
+| Handshape (nondom.) | 87.5% | **88.1%** |
+| Attitude (nondom.) | 79.4% | **81.7%** |
 
 ¹ For contact location and manner the comparison is against the same
 conv-only alignment model retrained on the v3 labels (scored on v3 targets).
 
-**v4 labels (current checkpoint, 2026-10-29).** The checkpoint is fine-tuned on
+**v4 labels (2026-10-29).** The checkpoint is fine-tuned on
 label version v4: a grammar-based coverage check of the SSLL descriptions found
 parts the v3 parser dropped, now parsed — shape changes with adverbials
 ("förändras först/sedan till X", chained changes), bare motion directions
@@ -439,19 +436,35 @@ fine-tunes the second pretraining iteration adds ≈ +1 pt on location, manner
 and motion (run-to-run spread ≈ 0.5–1 pt) and is neutral on hand shape and
 attitude.
 
-Handshape phase sequences: exact match 71.1 % of all clips (vs 46.5 %), 40.8 % of
-multi-phase clips (vs 29.1 %), normalised edit distance 0.176 (vs 0.317),
-last phase of multi-phase clips 80.5 % (vs 72.8 %), phase-count MAE 0.27 (vs 0.95).
+Handshape phase sequences: exact match 70.4 % of all clips (vs 46.5 %), 40.4 % of
+multi-phase clips (vs 29.1 %), normalised edit distance 0.180 (vs 0.317),
+last phase of multi-phase clips 80.4 % (vs 72.8 %); phase-count MAE 0.27 for the v4 checkpoint (vs 0.95).
 
-**Limitation — continuous signing.** On running signing (SSLC, 15 videos of
-held-out signers) the transformer models change handshape far less often than the
-convolutional `stsnet_v02_mas.pt`-type model (≈0.8 vs 1.9 changes/s) and their
-per-frame change signal correlates less with hand-pose change (Spearman ρ ≈ 0.27
-vs 0.44). The models are trained on isolated dictionary clips, and the transformer
-appears to settle on one stable shape per sign. Restricting attention to ±16 frames
-or adding a loss on short random crops did not change this. Hence
-`stsnet_v02_mas.pt` remains the recommended checkpoint; use `stsnet_v02_mpp.pt`
-for isolated signs, where its gains above hold.
+**Continuous signing (current checkpoint, 2026-10-30).** The previous
+transformer checkpoints under-segmented running signing: the mined SSLC clips
+were cut exactly to the gloss span, so the transformer never saw neighbouring
+signs in training and let them dominate at inference. The current checkpoint is
+fine-tuned with up to ±4 s (random 0–100 frames per side) of the surrounding
+continuous video around each mined clip; the losses still apply only to the
+gloss span. The SSLL numbers above are for this checkpoint; against the
+previous one they are within ±1 pt.
+
+Evaluation on SSLC gloss instances that were never in training (16,110
+single-shape / 3,898 multi-shape glosses whose SSLL entry has one unambiguous
+handshape sequence; the model runs continuously over the whole video):
+
+| | `stsnet_v02_mas.pt` | previous `mpp` | `stsnet_v02_mpp.pt` |
+|---|---|---|---|
+| right shape, single-shape glosses | 46.5 % | 32.3 % | **52.5 %** |
+| right shape, multi-shape glosses | 42.3 % | 28.5 % | **54.6 %** |
+| first shape right, multi-shape glosses | 12.6 % | 8.2 % | **25.9 %** |
+| spurious changes in single-shape glosses | 32 % | 13 % | 18 % |
+| same, held-out signers only (single / multi) | 43.0 / 43.8 % | 29.5 / 29.7 % | **50.3 / 58.7 %** |
+
+On 15 held-out-signer SSLC videos, its per-frame handshape changes track
+hand-pose change about as well as the conv model (Spearman ρ 0.42 vs 0.44, equal
+precision, 1.5 vs 1.9 changes/s; the previous checkpoint had ρ 0.27, 0.8
+changes/s).
 
 The training code for this checkpoint (pretraining, v3/v4 labels) currently lives
 in the research repository; `scripts/train_clip.py` here trains the conv-only
@@ -485,8 +498,8 @@ scripts/
 checkpoints/
   stsnet_v02.pt               pretrained v0.2 checkpoint — 3D (xyz) input (Git LFS)
   stsnet_v02_noz.pt           pretrained v0.2 checkpoint — 2D (xy only) input (Git LFS)
-  stsnet_v02_mas.pt           v0.2, 2D, monotonic-alignment trained: ordered per-frame phases — recommended (Git LFS)
-  stsnet_v02_mpp.pt           v0.2, 2D, + transformer, masked-prediction pretraining, manner labels — isolated signs (Git LFS)
+  stsnet_v02_mas.pt           v0.2, 2D, monotonic-alignment trained: ordered per-frame phases — conv-only (Git LFS)
+  stsnet_v02_mpp.pt           v0.2, 2D, + transformer, masked-prediction pretraining, manner labels, continuous context — recommended (Git LFS)
 data/
   sts_handformer.txt         handshape vocabulary (42 classes)
 v0.1/                        standalone v0.1 tree — own package, scripts, checkpoint, data
