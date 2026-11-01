@@ -3,20 +3,14 @@
 Phonological property prediction for Swedish Sign Language (STS) from pose keypoints.
 
 **Current version: v0.2** — clip-level attention-pooled model (`ClipClassifier`).
-Recommended checkpoint: **`checkpoints/stsnet_v02_mas.pt`** (2D input, convolutional,
-monotonic-alignment trained per-frame phases — see
-[below](#per-frame-phase-sequences-stsnet_v02_maspt)).
-
-> **`stsnet_v02_mpp.pt` (transformer)** is more accurate on isolated dictionary
-> signs (SSLL) and, since 2026-10-30, also on continuous signing (SSLC: right
-> handshape in 52.5 % vs 46.5 % of unseen gloss instances, half the spurious
-> changes). But it smooths over brief shape changes: in `1-2-3-regeln`
-> (Pekfingret → V → W → Pekfingret, with V and W lasting ~0.5 s together) it
-> predicts Pekfingret throughout, where `stsnet_v02_mas.pt` gets the full
-> sequence. Use `stsnet_v02_mpp.pt` for the most accurate labels per sign; use
-> `stsnet_v02_mas.pt` when short handshape changes in the per-frame output
-> matter. See
-> [below](#transformer--masked-prediction-pretraining-stsnet_v02_mpppt).
+Recommended checkpoint: **`checkpoints/stsnet_v02_mpp.pt`** (2D input, convolution +
+3-layer transformer, masked-prediction pretraining, monotonic-alignment trained per-frame
+phases — see [below](#transformer--masked-prediction-pretraining-stsnet_v02_mpppt)).
+It is the most accurate checkpoint on isolated dictionary signs (SSLL), on
+continuous signing (SSLC) and on handshape sequences, including brief changes
+(e.g. `1-2-3-regeln`: Pekfingret → V → W → Pekfingret). `checkpoints/stsnet_v02_mas.pt`
+is the smaller convolution-only alternative (no transformer); it changes handshape
+more readily from frame to frame, including more spurious changes.
 
 v0.1 and v0.2 are incompatible model families and live in separate trees.
 For the v0.1 per-frame BiLSTM model see [v0.1/README.md](v0.1/README.md).
@@ -122,7 +116,7 @@ inference you can choose between clip-level and per-frame prediction modes.
 ```python
 from stsnet import ClipClassifierInference
 
-model = ClipClassifierInference("checkpoints/stsnet_v02_mas.pt", device="cuda")
+model = ClipClassifierInference("checkpoints/stsnet_v02_mpp.pt", device="cuda")
 ```
 
 ### Clip-level prediction (one label set per sign)
@@ -184,7 +178,7 @@ video (`.mp4`, `.mov`, `.avi`, `.mkv`, `.webm` — pose is extracted via
 Per-frame predictions, CSV to stdout:
 
 ```bash
-python scripts/predict.py clip.pose --ckpt checkpoints/stsnet_v02_mas.pt
+python scripts/predict.py clip.pose --ckpt checkpoints/stsnet_v02_mpp.pt
 ```
 
 ```
@@ -384,8 +378,8 @@ n = 4043 clips, 1320 of them multi-phase):
 | last phase correct, multi-phase clips | 4.8% | **72.8%** |
 | phase-count error (MAE, phases) | 2.43 | **0.95** |
 
-Same picture for attitude, contact location and motion. `stsnet_v02_mas.pt` is the
-recommended checkpoint, and the one to use whenever the per-frame output matters; `stsnet_v02_noz.pt` remains ~1–5 pts
+Same picture for attitude, contact location and motion. Among the conv-only
+checkpoints, `stsnet_v02_mas.pt` is the one to use whenever the per-frame output matters; `stsnet_v02_noz.pt` remains ~1–5 pts
 better on clip-level attitude / contact / motion / hand type.
 
 #### Transformer + masked-prediction pretraining: `stsnet_v02_mpp.pt`
@@ -411,14 +405,14 @@ SSLL val (same split as above), clip-level top-1-in-set:
 
 | Property | `stsnet_v02_mas.pt` | `stsnet_v02_mpp.pt` |
 |---|---|---|
-| Handshape (dom.) | 88.0% | **89.4%** |
-| Attitude (dom.) | 78.9% | **81.7%** |
-| Contact location (v4 targets) | 77.7%¹ | **83.6%** |
-| Manner (9 classes, v4 targets) | 67.8%¹ | **75.5%** |
-| Motion direction (v4 targets) | 58.9% | **70.4%** |
-| Hand type | 95.0% | **96.6%** |
-| Handshape (nondom.) | 87.5% | **88.1%** |
-| Attitude (nondom.) | 79.4% | **81.7%** |
+| Handshape (dom.) | 88.0% | **90.1%** |
+| Attitude (dom.) | 78.9% | **82.2%** |
+| Contact location (v4 targets) | 77.7%¹ | **83.3%** |
+| Manner (9 classes, v4 targets) | 67.8%¹ | **74.9%** |
+| Motion direction (v4 targets) | 58.9% | **70.2%** |
+| Hand type | 95.0% | **96.9%** |
+| Handshape (nondom.) | 87.5% | **89.4%** |
+| Attitude (nondom.) | 79.4% | **81.9%** |
 
 ¹ For contact location and manner the comparison is against the same
 conv-only alignment model retrained on the v3 labels (scored on v3 targets).
@@ -443,18 +437,17 @@ fine-tunes the second pretraining iteration adds ≈ +1 pt on location, manner
 and motion (run-to-run spread ≈ 0.5–1 pt) and is neutral on hand shape and
 attitude.
 
-Handshape phase sequences: exact match 70.4 % of all clips (vs 46.5 %), 40.4 % of
-multi-phase clips (vs 29.1 %), normalised edit distance 0.180 (vs 0.317),
-last phase of multi-phase clips 80.4 % (vs 72.8 %); phase-count MAE 0.27 for the v4 checkpoint (vs 0.95).
+Handshape phase sequences: exact match 78.4 % of all clips (vs 46.5 %), 64.1 % of
+multi-phase clips (vs 29.1 %), normalised edit distance 0.134 (vs 0.317),
+last phase of multi-phase clips 87.4 % (vs 72.8 %).
 
-**Continuous signing (current checkpoint, 2026-10-30).** The previous
+**Continuous signing (2026-10-30).** The previous
 transformer checkpoints under-segmented running signing: the mined SSLC clips
 were cut exactly to the gloss span, so the transformer never saw neighbouring
-signs in training and let them dominate at inference. The current checkpoint is
+signs in training and let them dominate at inference. The checkpoint is now
 fine-tuned with up to ±4 s (random 0–100 frames per side) of the surrounding
 continuous video around each mined clip; the losses still apply only to the
-gloss span. The SSLL numbers above are for this checkpoint; against the
-previous one they are within ±1 pt.
+gloss span.
 
 Evaluation on SSLC gloss instances that were never in training (16,110
 single-shape / 3,898 multi-shape glosses whose SSLL entry has one unambiguous
@@ -462,24 +455,32 @@ handshape sequence; the model runs continuously over the whole video):
 
 | | `stsnet_v02_mas.pt` | previous `mpp` | `stsnet_v02_mpp.pt` |
 |---|---|---|---|
-| right shape, single-shape glosses | 46.5 % | 32.3 % | **52.5 %** |
-| right shape, multi-shape glosses | 42.3 % | 28.5 % | **54.6 %** |
-| first shape right, multi-shape glosses | 12.6 % | 8.2 % | **25.9 %** |
-| spurious changes in single-shape glosses | 32 % | 13 % | 18 % |
-| same, held-out signers only (single / multi) | 43.0 / 43.8 % | 29.5 / 29.7 % | **50.3 / 58.7 %** |
+| right shape, single-shape glosses | 46.5 % | 32.3 % | **53.1 %** |
+| right shape, multi-shape glosses | 42.3 % | 28.5 % | **54.5 %** |
+| first shape right, multi-shape glosses | 12.6 % | 8.2 % | **24.3 %** |
+| spurious changes in single-shape glosses | 32 % | 13 % | 20 % |
+| same, held-out signers only (single / multi) | 43.0 / 43.8 % | 29.5 / 29.7 % | **51.2 / 56.9 %** |
 
 On 15 held-out-signer SSLC videos, its per-frame handshape changes track
-hand-pose change about as well as the conv model (Spearman ρ 0.42 vs 0.44, equal
+hand-pose change about as well as the conv model (Spearman ρ 0.43 vs 0.44, equal
 precision, 1.5 vs 1.9 changes/s; the previous checkpoint had ρ 0.27, 0.8
 changes/s).
 
-**Limitation — brief shape changes.** The transformer still smooths over short
-handshape phases. In `1-2-3-regeln` (Pekfingret → V → W → Pekfingret, a training
-clip) V and W together last ~12 frames; `stsnet_v02_mas.pt` decodes the full
-sequence, while `stsnet_v02_mpp.pt` (current and previous) predicts Pekfingret
-throughout (V peaks at 0.28, W at 0.02). On SSLC multi-shape glosses it reports
-any change in 25 % of instances, vs 36 % for `stsnet_v02_mas.pt`. Hence
-`stsnet_v02_mas.pt` remains the recommended checkpoint for per-frame output.
+**Brief shape changes (current checkpoint, 2026-10-31).** The context-trained
+transformer still smoothed over short handshape phases: in `1-2-3-regeln`
+(Pekfingret → V → W → Pekfingret, V and W together ~12 frames) it predicted
+Pekfingret throughout. Its own training alignment gave V and W the 3-frame
+minimum, so the per-frame loss was dominated by the long phases and the model
+reinforced its own smoothing. The current checkpoint weights the per-frame loss
+so that every phase of a clip counts equally (weight ∝ 1 / aligned phase length).
+It now decodes `1-2-3-regeln` as Pekfingret [0–22] → V [23–29] → W [30–38] →
+Pekfingret [39–90]. Short phases (≤ 8 frames) in held-out multi-phase SSLL clips are
+found 84 % of the time (previous checkpoint 69 %, `stsnet_v02_mas.pt` 65 %), and
+held-out fingerspelled words get the exact letter-handshape sequence in 73 %
+(previous 64 %, `stsnet_v02_mas.pt` 36 %). SSLC results above are unchanged within
+run-to-run noise (a replicate fine-tune agrees within ~1–1.5 pts). Phases longer
+than 8 frames are still found slightly less often than by `stsnet_v02_mas.pt`
+(≈ 92 % vs 95–97 %).
 
 The training code for this checkpoint (pretraining, v3/v4 labels) currently lives
 in the research repository; `scripts/train_clip.py` here trains the conv-only
@@ -513,8 +514,8 @@ scripts/
 checkpoints/
   stsnet_v02.pt               pretrained v0.2 checkpoint — 3D (xyz) input (Git LFS)
   stsnet_v02_noz.pt           pretrained v0.2 checkpoint — 2D (xy only) input (Git LFS)
-  stsnet_v02_mas.pt           v0.2, 2D, monotonic-alignment trained: ordered per-frame phases — recommended (Git LFS)
-  stsnet_v02_mpp.pt           v0.2, 2D, + transformer, masked-prediction pretraining, manner labels, continuous context (Git LFS)
+  stsnet_v02_mas.pt           v0.2, 2D, monotonic-alignment trained: ordered per-frame phases — conv-only (Git LFS)
+  stsnet_v02_mpp.pt           v0.2, 2D, + transformer, masked-prediction pretraining, manner labels, continuous context, phase-balanced — recommended (Git LFS)
 data/
   sts_handformer.txt         handshape vocabulary (42 classes)
 v0.1/                        standalone v0.1 tree — own package, scripts, checkpoint, data
