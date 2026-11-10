@@ -538,3 +538,11 @@ checkpoint at `v0.1/checkpoints/stsnet_base.pt`.
 Jonas Beskow, *STS-net — a phonological property prediction model for Swedish
 sign language*. Nordic Prosody XIV, Stockholm, 18–20 August 2026.
 [PDF](docs/stsnet_nordic_prosody_26.pdf)
+
+---
+
+## License
+
+[CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) — see
+[LICENSE](LICENSE). This matches the license of the SSLL and SSLC data the
+models are trained on.

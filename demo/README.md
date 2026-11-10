@@ -7,7 +7,7 @@ sdk: gradio
 sdk_version: 5.49.1
 app_file: app.py
 pinned: false
-license: mit
+license: cc-by-nc-sa-4.0
 python_version: "3.12"
 ---
 
@@ -41,3 +41,8 @@ scripts/              scripts/           (incl. inspector.py, reused for inferen
 pyproject.toml        pyproject.toml     (lets `pip install .` register the stsnet package)
 checkpoints/stsnet_v02.pt   checkpoints/stsnet_v02.pt
 ```
+
+## License
+
+[CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/), the
+license of the SSLL and SSLC data the models are trained on.
